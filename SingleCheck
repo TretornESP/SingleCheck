@@ -255,6 +255,91 @@ if [[ "$ALN" == *.cram ]] && [ -z "$REFERENCE" ]; then
     exit 1
 fi
 
+# Metaphyler location (override with the $METAPHYLER environment variable).
+METAPHYLER="${METAPHYLER:-$HOME/apps/Metaphyler/MetaPhylerSRV0.115/metaphyler.pl}"
+
+############################################################################
+#                        CHECK DEPENDENCIES                                #
+############################################################################
+# Fail fast: verify every external tool, conda env, module-provided binary,
+# helper script, folder and file is present BEFORE doing any heavy work.
+
+echo "> Checking dependencies"
+missing=0
+
+# A module-provided tool is only considered loaded if its binary is on $PATH
+# (module load runs best-effort with 2>/dev/null, so this is the real check).
+check_cmd() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf "  [MISSING] command '%s' not found on PATH%s\n" "$1" "${2:+ -- $2}" >&2
+        missing=1
+    fi
+}
+
+# Core tools (provided by SLURM modules / conda env)
+check_cmd samtools "module load samtools/1.10"
+check_cmd bedtools "module load bedtools/2.28.0"
+check_cmd mosdepth "conda env .../CommonCondaEnvironments/mosdepth"
+check_cmd Rscript  "module load R/3.6.3"
+check_cmd bc
+check_cmd awk
+check_cmd sort
+check_cmd zcat
+check_cmd gzip
+
+# Aligner is only needed when the input is FASTQ
+if [ "$METHOD" == "Paired-end" ] || [ "$METHOD" == "Single-end" ]; then
+    if ! command -v bwa-mem2 >/dev/null 2>&1 && ! command -v bwa >/dev/null 2>&1; then
+        printf "  [MISSING] no aligner on PATH (need bwa-mem2 or bwa)\n" >&2
+        missing=1
+    fi
+fi
+
+# R packages required by the metric scripts must be loadable
+if command -v Rscript >/dev/null 2>&1; then
+    if ! Rscript -e 'ok <- all(sapply(c("tidyr","dplyr","matrixStats"), requireNamespace, quietly=TRUE)); quit(status=if(ok) 0 else 1)' >/dev/null 2>&1; then
+        printf "  [MISSING] R packages not all installed (need tidyr, dplyr, matrixStats)\n" >&2
+        missing=1
+    fi
+fi
+
+# Helper R scripts shipped with the pipeline
+for rs in GiniIndex.R CoefficientOfVariation.R Autocorrelation.R MAD.R; do
+    if [ ! -f "${SCRIPTDIR}/src/${rs}" ]; then
+        printf "  [MISSING] helper script ${SCRIPTDIR}/src/${rs}\n" >&2
+        missing=1
+    fi
+done
+
+# Metaphyler (contamination detection)
+if [ ! -f "$METAPHYLER" ]; then
+    printf "  [MISSING] Metaphyler not found at %s (set \$METAPHYLER to override)\n" "$METAPHYLER" >&2
+    missing=1
+fi
+
+# Reference and its indexes (required for FASTQ alignment and CRAM input)
+if [ -n "$REFERENCE" ]; then
+    [ -f "$REFERENCE" ]        || { printf "  [MISSING] reference fasta %s\n" "$REFERENCE" >&2; missing=1; }
+    [ -f "${REFERENCE}.fai" ]  || { printf "  [MISSING] samtools faidx index %s.fai\n" "$REFERENCE" >&2; missing=1; }
+fi
+
+# Pre-aligned input file and its index
+if [ "$METHOD" == "Aligned" ]; then
+    [ -f "$ALN" ]    || { printf "  [MISSING] input file %s\n" "$ALN" >&2; missing=1; }
+    [ -f "$ALNIDX" ] || { printf "  [MISSING] index %s (run samtools index)\n" "$ALNIDX" >&2; missing=1; }
+fi
+
+# Working directory and node-local scratch must be writable
+WORKDIR_CHECK=$(dirname "$NAME")
+[ -d "$WORKDIR_CHECK" ] && [ -w "$WORKDIR_CHECK" ] || { printf "  [MISSING] output dir %s not writable\n" "$WORKDIR_CHECK" >&2; missing=1; }
+[ -d "$SCRATCH" ] && [ -w "$SCRATCH" ]             || { printf "  [MISSING] scratch dir %s not writable\n" "$SCRATCH" >&2; missing=1; }
+
+if [ "$missing" -ne 0 ]; then
+    printf "\nError: one or more dependencies are missing (see above). Aborting before running.\n" >&2
+    exit 1
+fi
+echo "  all dependencies OK"
+
 # ///////// CONDA ENVIRONMENTS MISSING, CREATE A SINGLE ONE
 
 ############################################################################
@@ -435,7 +520,7 @@ Rscript ${SCRIPTDIR}/src/MAD.R ${NAME}.${WSIZE}
 # Run Metaphyler on all unmapped reads, not only the downsampled ones
 echo "> METAPHYLER"
 samtools view -f 0x4 -@ $THREADS $SAMREF ${ALN} | awk '{OFS="\t"; print ">"$1"\n"$10}' > ${NAME}.unmapped.fasta
-~/apps/Metaphyler/MetaPhylerSRV0.115/metaphyler.pl 2 ${NAME}.unmapped.fasta ${NAME}
+"$METAPHYLER" 2 ${NAME}.unmapped.fasta ${NAME}
 
 
 samtools view -bF 2304 -@ $THREADS ${NAME}.${downsampling_depth}X.bam > ${NAME}.${downsampling_depth}X.primary.bam
