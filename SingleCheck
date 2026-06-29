@@ -185,13 +185,17 @@ fi
 #                        SET UP VARIABLES                                  #
 ############################################################################
 
-if [ -n "$SLURM_JOB_ID" ] && [ "$SLURM_JOB_ID" -eq "$SLURM_JOB_ID" ]
-then
-    SCRIPT=$(scontrol show job $SLURM_JOBID | awk -F= '/Command=/{print $2}' | awk '{print $1}')
-    SCRIPTDIR=$(dirname $SCRIPT)
-else
-    SCRIPT=$0
-    SCRIPTDIR=$(dirname $SCRIPT)	
+# Resolve the directory holding this script (and its src/ helpers).
+# Prefer the real path of the script itself -- this works when run directly and
+# when run inside an salloc/srun interactive allocation. Only fall back to
+# scontrol for the `sbatch` case, where SLURM executes a spooled copy whose
+# path is not next to src/ (there scontrol's Command= gives the submitted path).
+SCRIPTDIR=$( cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P )
+if [ ! -d "${SCRIPTDIR}/src" ] && [ -n "${SLURM_JOB_ID:-}" ]; then
+    SCRIPT=$(scontrol show job "$SLURM_JOB_ID" 2>/dev/null | awk -F= '/Command=/{print $2}' | awk '{print $1}')
+    if [ -n "$SCRIPT" ] && [ -d "$(dirname "$SCRIPT")/src" ]; then
+        SCRIPTDIR=$( cd "$(dirname "$SCRIPT")" >/dev/null 2>&1 && pwd -P )
+    fi
 fi
 
 ###//////////// PRINT A MESSAGE WITH ALL THE VARIABLES //////////
@@ -209,6 +213,19 @@ fi
         module load gcc/6.4.0 bwa/0.7.17 2> /dev/null
 	module load picard/2.18.14 2> /dev/null
         source activate /mnt/netapp1/posadalab/APPS/CommonCondaEnvironments/mosdepth 2> /dev/null
+
+        # Optional per-cluster environment overrides. Point $SINGLECHECK_ENV at a
+        # file that runs the right `module load ...` for this site and/or exports
+        # tool locations (MOSDEPTH, BEDTOOLS, METAPHYLER, ...). Sourced last so it
+        # wins over the defaults above. See singlecheck_env.sh.example.
+        if [ -n "${SINGLECHECK_ENV:-}" ] && [ -f "$SINGLECHECK_ENV" ]; then
+            source "$SINGLECHECK_ENV"
+        fi
+
+        # Tool handles: a bare command found on $PATH, or an absolute path set by
+        # the config / environment (for tools not provided as modules).
+        MOSDEPTH="${MOSDEPTH:-mosdepth}"
+        BEDTOOLS="${BEDTOOLS:-bedtools}"
 
 ############################################################################
 #                        HPC ENVIRONMENT TUNING                            #
@@ -276,11 +293,20 @@ check_cmd() {
     fi
 }
 
-# Core tools (provided by SLURM modules / conda env)
-check_cmd samtools "module load samtools/1.10"
-check_cmd bedtools "module load bedtools/2.28.0"
-check_cmd mosdepth "conda env .../CommonCondaEnvironments/mosdepth"
-check_cmd Rscript  "module load R/3.6.3"
+# Like check_cmd but also accepts an absolute path (for tools given via
+# $MOSDEPTH/$BEDTOOLS rather than a module).
+check_tool() {
+    if ! command -v "$1" >/dev/null 2>&1 && [ ! -x "$1" ]; then
+        printf "  [MISSING] tool '%s' not found on PATH or as an executable%s\n" "$1" "${2:+ -- $2}" >&2
+        missing=1
+    fi
+}
+
+# Core tools (provided by SLURM modules / conda env / $SINGLECHECK_ENV)
+check_cmd  samtools  "module load samtools"
+check_tool "$BEDTOOLS" "module load bedtools, or set BEDTOOLS=/path/to/bedtools"
+check_tool "$MOSDEPTH" "set MOSDEPTH=/path/to/mosdepth in \$SINGLECHECK_ENV"
+check_cmd  Rscript   "module load R"
 check_cmd bc
 check_cmd awk
 check_cmd sort
@@ -450,7 +476,7 @@ echo "> Running mosdepth"
 
         # --fast-mode dont look at internal cigar operations or correct mate overlaps (recommended for most use-cases). Avoids the extra calculations of mate pair overlap and cigar operations
         # 772 flag: exclude read unmapped, not primary alignment, read fails platform/vendor quality checks
-        MOSDEPTH_PRECISION=${precision} mosdepth \
+        MOSDEPTH_PRECISION=${precision} "$MOSDEPTH" \
                 -t $THREADS \
                 --fast-mode \
                 --by $WSIZE \
@@ -470,7 +496,7 @@ echo "> Creating input for autocorrelation"
         else if (alpha >= $2 && alpha < $3) {start=$2-alpha;if (start<0) {print $1"\t"0"\t"$3-alpha"\t"$4} else {print $1"\t"start"\t"$3-alpha"\t"$4}; print_switch=1}}' | \
         $GZIP_CMD > ${NAME}.${WSIZE}.${DELTA}.bed.gz
 
-        bedtools unionbedg -filler NA  \
+        "$BEDTOOLS" unionbedg -filler NA  \
         -i ${NAME}.${WSIZE}.per-base.bed.gz \
         ${NAME}.${WSIZE}.${DELTA}.bed.gz | \
         grep -E "$DIPLOID_REGEX" | \
