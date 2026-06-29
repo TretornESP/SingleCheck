@@ -142,8 +142,8 @@ fi
 # mandatory arguments
 if [ "$#" -eq 1 ]; then
 	FILE="$1"
-        if [[ "$FILE" != *.bam ]] && [[ "$FILE" != *.fastq.gz ]]; then
-            printf "\nFile extension must be \'.bam\' or \'.fastq.gz\'\n" >&2
+        if [[ "$FILE" != *.bam ]] && [[ "$FILE" != *.cram ]] && [[ "$FILE" != *.fastq.gz ]]; then
+            printf "\nFile extension must be \'.bam\', \'.cram\' or \'.fastq.gz\'\n" >&2
             echo "$usage" >&2
             exit 1
         fi
@@ -155,15 +155,15 @@ if [ "$#" -eq 1 ]; then
 	    echo "$usage" >&2
 	    exit 1
 	fi
-	if [[ "$FILE" == *.bam ]];then
+	if [[ "$FILE" == *.bam ]] || [[ "$FILE" == *.cram ]];then
 	    METHOD="Aligned"
         else
 	    METHOD="Single-end"
             FASTQ1=$FILE
             FASTQ2=""
 	fi
-	
-	NAME=$(echo $FILE | sed 's/.bam//' | sed 's/.fastq.gz//' )
+
+	NAME=$(echo $FILE | sed 's/.bam$//' | sed 's/.cram$//' | sed 's/.fastq.gz$//' )
 	
 elif [ "$#" -eq 2 ]; then 
 	FASTQ1="$1"
@@ -212,10 +212,55 @@ fi
 	module load gcc/6.4.0 R/3.6.3 2> /dev/null
         module load miniconda3/4.8.2 2> /dev/null
         module load gcccore/6.4.0 bedtools/2.28.0 2> /dev/null
-        #module load gcccore/6.4.0 bwa-mem2/2.0 2> /dev/null
+        module load gcccore/6.4.0 bwa-mem2/2.0 2> /dev/null
         module load gcc/6.4.0 bwa/0.7.17 2> /dev/null
 	module load picard/2.18.14 2> /dev/null
         source activate /mnt/netapp1/posadalab/APPS/CommonCondaEnvironments/mosdepth 2> /dev/null
+
+############################################################################
+#                        HPC ENVIRONMENT TUNING                            #
+############################################################################
+# (Item 3/4/6 of HPC_OPTIMIZATION.md)
+
+# Byte-wise locale: speeds up grep/sort/awk and keeps '.' as decimal point.
+export LC_ALL=C
+
+# Node-local scratch for all temporary data (sort spill, samtools sort, TMPDIR).
+# Prefer the SLURM-provided per-job scratch; fall back to $TMPDIR then /tmp.
+SCRATCH="${SLURM_TMPDIR:-${TMPDIR:-/tmp}}"
+export TMPDIR="$SCRATCH"
+
+# Fastest available compressor for sort spill files.
+if command -v zstd >/dev/null 2>&1; then SORTCOMP=zstd
+elif command -v pigz >/dev/null 2>&1; then SORTCOMP=pigz
+else SORTCOMP=gzip; fi
+
+# Multithreaded gzip (stdin -> stdout) for the per-base track if available.
+if command -v pigz >/dev/null 2>&1; then GZIP_CMD="pigz -c -p $THREADS"
+elif command -v bgzip >/dev/null 2>&1; then GZIP_CMD="bgzip -@ $THREADS -c"
+else GZIP_CMD="gzip -c"; fi
+
+# Reference argument for samtools when reading CRAM (harmless/ignored for BAM).
+SAMREF=""
+if [ -n "$REFERENCE" ]; then SAMREF="--reference $REFERENCE"; fi
+
+# Main aligned-file handle (BAM or CRAM) and its index.
+# For FASTQ input the alignment step produces ${NAME}.bam (see below).
+if [ "$METHOD" == "Aligned" ]; then
+    ALN="$FILE"
+else
+    ALN="${NAME}.bam"
+fi
+case "$ALN" in
+  *.cram) ALNIDX="${ALN}.crai" ;;
+  *)      ALNIDX="${ALN}.bai" ;;
+esac
+
+# CRAM input cannot be decoded without a reference.
+if [[ "$ALN" == *.cram ]] && [ -z "$REFERENCE" ]; then
+    printf "\nError: CRAM input requires a reference (-r ref.fa)\n" >&2
+    exit 1
+fi
 
 # ///////// CONDA ENVIRONMENTS MISSING, CREATE A SINGLE ONE
 
@@ -231,12 +276,18 @@ if [ "$METHOD" == "Paired-end" ] || [ "$METHOD" == "Single-end" ]; then
              exit 1
         fi
 
-	bwa mem \
+	# Prefer bwa-mem2 (~1.3-1.8x faster) when its index is present; else classic bwa.
+	if command -v bwa-mem2 >/dev/null 2>&1 && [ -f "${REFERENCE}.bwt.2bit.64" ]; then
+		ALIGNER="bwa-mem2 mem"
+	else
+		ALIGNER="bwa mem"
+	fi
+	$ALIGNER \
 		-t $THREADS $REFERENCE \
 		$FASTQ1 $FASTQ2 | \
 		samtools sort -@$THREADS \
 		-o ${NAME}.bam -
-        samtools index ${NAME}.bam
+        samtools index -@ $THREADS ${NAME}.bam
 fi
 
 ############################################################################
@@ -244,42 +295,35 @@ fi
 ############################################################################
 
 
-if [ ! -f ${NAME}.bam.bai ]; then
-	printf "\nError: your BAM file must be indexed\n" >&2
+if [ ! -f ${ALNIDX} ]; then
+	printf "\nError: your BAM/CRAM file must be indexed\n" >&2
         exit 1
 fi
 
 # Calculate genome length
-genome_length=$(samtools view -H  ${NAME}.bam | grep "^@SQ" | awk '{sum+=substr($3,4,length($3)-1)}END{print sum}')
+genome_length=$(samtools view -H $SAMREF ${ALN} | grep "^@SQ" | awk '{sum+=substr($3,4,length($3)-1)}END{print sum}')
 #genome_length=$(cut -f2 ${RESDIR}/${REF}.fai | awk '{sum+=$1}END{print sum}')
 
 # IF READS HAVE BEEN FILTERED OUT IT IS NOT POSSIBLE TO COUNT SUCH BASES
 # QUICK RAW SEQUENCING DEPTH CALCULATION: NO POSIBLE TO COUNT CLIPPED BASES. 
+# Primary alignments only (exclude supplementary 2048 + secondary 256) so reads
+# and clipped bases are not counted twice. Streamed in one pass -- no multi-TB
+# ${NAME}.primary.bam copy is written (Item 1 of HPC_OPTIMIZATION.md).
 if [ "$DOWNSAMPLING" = "ImpreciseSeqDepthCalc" ];then
 	# Calculate total sequenced bases
-	# Remove supplementary alignments and secondary to avoid counting the same read twice
-	# If I do not remove supplementary I will count hard bases twice and the same read twice using samtools idxstats
-	samtools view -bF 2304 ${NAME}.bam > ${NAME}.primary.bam
-	samtools index ${NAME}.primary.bam
-	# idxstats: The output is TAB-delimited with each line consisting of reference sequence name, sequence length, # mapped read-segments and # unmapped read-segments. It is written to stdout. Note this may count reads multiple times if they are mapped more than once or in multiple fragments.
-	raw_reads=$(samtools idxstats ${NAME}.primary.bam | \
-		awk '{sum+=($3+$4)}END{print sum}')
+	# Count primary read-segments directly (no temp file, multithreaded decode)
+	raw_reads=$(samtools view -c -F 2304 -@ $THREADS $SAMREF ${ALN})
 	# Use the first million of reads to calculate average read length
-	mean_readlength=$(samtools view ${NAME}.primary.bam | head -n 1000000 | cut -f 10 | awk '{ print length }'| sort | uniq -c | awk '{sum+=$1*$2;num+=$1}END{print sum/num}')
-	
+	mean_readlength=$(samtools view -F 2304 $SAMREF ${ALN} | head -n 1000000 | cut -f 10 | awk '{ print length }'| sort | uniq -c | awk '{sum+=$1*$2;num+=$1}END{print sum/num}')
+
 	raw_bases=$(awk -v meanl=$mean_readlength -v rawr=$raw_reads 'BEGIN{print rawr*meanl}')
 else
-	samtools view -bF 2304 ${NAME}.bam > ${NAME}.primary.bam
-	samtools index ${NAME}.primary.bam
-	
 	# SLOW RAW SEQUENCING DEPTH CALCULATION: POSSIBLE TO COUNT CLIPPED BASES
-	# Get the number of bases which are aligned, soft-clipped or unmapped (only count only primary aligments)
-	aligned_soft_bases=$(samtools view ${NAME}.primary.bam | \
-		cut -f10 | awk '{total+=length}END{print total}')
-	## Get the number of bases which are hard-clipped
-	hard_bases=$(samtools view ${NAME}.primary.bam | cut -f6 | \
-		grep H | sed 's/\([0-9]*\)\([A-Z]\)/\1\2\n/g' | \
-		grep -v "^$" | grep H | sed 's/H//' | awk '{sum+=$1}END{print sum}')
+	# Single streaming pass over primary alignments; SEQ and CIGAR pulled together.
+	read aligned_soft_bases hard_bases < <(samtools view -F 2304 $SAMREF ${ALN} | \
+		awk '{soft+=length($10); cig=$6;
+		      while (match(cig,/[0-9]+H/)) {hard+=substr(cig,RSTART,RLENGTH-1); cig=substr(cig,RSTART+RLENGTH)}}
+		     END{print soft, hard+0}')
 	if [ -z "$hard_bases" ];then
 	       hard_bases=0
 	fi
@@ -287,8 +331,6 @@ else
 fi
 
 sequencing_depth=$(awk -v gl=$genome_length -v rawb=$raw_bases 'BEGIN{print rawb/gl}')
-rm ${NAME}.primary.bam.bai
-rm ${NAME}.primary.bam
 
 ############################################################################
 #                 DOWNSAMPLE AND CALCULATE COVERAGE BIAS                   #
@@ -299,26 +341,27 @@ rm ${NAME}.primary.bam
 #probability=$(awk -v ds_d=$downsampling_depth -v rs_d=$sequencing_depth 'BEGIN{print ds_d/rs_d}') 
 probability=`bc -l <<< "scale=10; $downsampling_depth / $sequencing_depth"`
 
-if [[ ! -z $(awk -v prob=$probability 'BEGIN{if (prob > 1) print "Lowest sequencing than downsampling selected"}') ]] || [[ "$DOWNSAMPLE" = "NO" ]]
+if [[ ! -z $(awk -v prob=$probability 'BEGIN{if (prob >= 1) print "Lowest sequencing than downsampling selected"}') ]] || [[ "$DOWNSAMPLE" = "NO" ]]
 then
-	ln -s ${NAME}.bam ${NAME}.${downsampling_depth}X.bam
-	samtools index ${NAME}.${downsampling_depth}X.bam
+	# Target depth >= actual (or -N): analyse the full file. The analysis handle is
+	# always a BAM; symlink when the input is already BAM, else materialise one.
+	if [[ "$ALN" == *.bam ]]; then
+		ln -sf "$(readlink -f ${ALN})" ${NAME}.${downsampling_depth}X.bam
+	else
+		samtools view -b -@ $THREADS $SAMREF ${ALN} -o ${NAME}.${downsampling_depth}X.bam
+	fi
+	samtools index -@ $THREADS ${NAME}.${downsampling_depth}X.bam
         DEPTH=$sequencing_depth
 else
-echo "Downsampling following "${ds_strategy}" strategy. From "${sequencing_depth}"X to "${downsampling_depth}"X."
-	# Reads from the same template (read-pairs,secondary and supplementary) are all either kept or discarded as a unit, with the goal of retaining reads from PROBABILITY * input templates. The results will contain approximately PROBABILITY * input reads, however for very small PROBABILITIES this may not be the case.
-# Take the exponential of the number
-	num=$(printf %e ${probability} | fold -w1 | tail -n 1)
-	accuracy=$(awk -v num=$num 'BEGIN{print 0.01*10^-num}')
-	echo "Downsampling following "${ds_strategy}" strategy. From "${sequencing_depth}"X to "${downsampling_depth}"X. Downsampling probability: "$probability". Accuracy: "${accuracy}
-	java -jar $EBROOTPICARD/picard.jar DownsampleSam \
-        	INPUT=${NAME}.bam \
-        	OUTPUT=${NAME}.${downsampling_depth}X.bam \
-        	RANDOM_SEED=1 \
-        	PROBABILITY=${probability} \
-        	STRATEGY=$ds_strategy \
-        	CREATE_INDEX=true \
-        	ACCURACY=$accuracy
+	# Replace single-threaded Picard DownsampleSam with multithreaded, streaming
+	# `samtools view -s SEED.FRACTION` (Item 2 of HPC_OPTIMIZATION.md).
+	# SEED=1 (mirrors Picard RANDOM_SEED=1); FRACTION = the kept probability.
+	# samtools samples by read-name hash, so mate pairs stay together as a unit.
+	frac="${probability#0}"          # bc may emit ".0123" or "0.0123" -> ".0123"
+	subsample_arg="1${frac}"         # -> "1.0123" (seed.fraction)
+	echo "Downsampling with samtools view -s. From "${sequencing_depth}"X to "${downsampling_depth}"X. Fraction kept: "$probability
+	samtools view -b -@ $THREADS $SAMREF -s ${subsample_arg} ${ALN} -o ${NAME}.${downsampling_depth}X.bam
+	samtools index -@ $THREADS ${NAME}.${downsampling_depth}X.bam
         DEPTH=$downsampling_depth
 fi
 
@@ -347,13 +390,13 @@ echo "> Creating input for autocorrelation"
         awk -v alpha=$DELTA -v print_switch=0 \
         '{if (print_switch==1) {start=$2-alpha; if (start<0) {print $1"\t"0"\t"$3-alpha"\t"$4} else{print $1"\t"start"\t"$3-alpha"\t"$4}}
         else if (alpha >= $2 && alpha < $3) {start=$2-alpha;if (start<0) {print $1"\t"0"\t"$3-alpha"\t"$4} else {print $1"\t"start"\t"$3-alpha"\t"$4}; print_switch=1}}' | \
-        gzip -c > ${NAME}.${WSIZE}.${DELTA}.bed.gz
+        $GZIP_CMD > ${NAME}.${WSIZE}.${DELTA}.bed.gz
 
         bedtools unionbedg -filler NA  \
         -i ${NAME}.${WSIZE}.per-base.bed.gz \
         ${NAME}.${WSIZE}.${DELTA}.bed.gz | \
         grep -E "$DIPLOID_REGEX" | \
-        sort --parallel=$THREADS --version-sort -k4 -k5 | \
+        sort --parallel=$THREADS -S 80% --compress-program=$SORTCOMP -T "$SCRATCH" --version-sort -k4 -k5 | \
         awk  \
         '{if (FNR==1){diff=$3-$2;value1=$4;value2=$5}
         else if (value1!=$4 || value2!=$5){print value1"\t"value2"\t"diff; diff=$3-$2;value1=$4;value2=$5}
@@ -366,9 +409,9 @@ echo "> Calculating gini and cv"
         zcat ${NAME}.${WSIZE}.regions.bed.gz | \
         grep -E "$DIPLOID_REGEX" | \
         awk '{print $4}' | \
-        sort -n | \
+        sort -n -T "$SCRATCH" | \
         uniq -c | \
-        awk '{print $2"\t"$1}' | sort -n -k1,1 \
+        awk '{print $2"\t"$1}' | sort -n -k1,1 -T "$SCRATCH" \
         > ${NAME}.${WSIZE}.freqs.txt
 
 Rscript ${SCRIPTDIR}/src/GiniIndex.R ${NAME}.${WSIZE} $WSIZE
@@ -389,7 +432,7 @@ echo "> Calculating MAD"
                 paste  <(zcat ${NAME}.${WSIZE}.regions.bed.gz) - | \
                 grep -E "$DIPLOID_REGEX" | \
                 awk '{if (NF==8 && $1==$5) {print $4"\t"$8} else if (NF==8 && $1!=$5){print $4}}' | \
-                sort | uniq -c | \
+                sort -T "$SCRATCH" | uniq -c | \
                 awk '{if (NF==3) {print $2"\t"$3"\t"$1}else {print $2"\tNA\t"$1}}' \
                 > ${NAME}.${WSIZE}.contiguous.txt
 
@@ -398,12 +441,12 @@ Rscript ${SCRIPTDIR}/src/MAD.R ${NAME}.${WSIZE}
 
 # Run Metaphyler on all unmapped reads, not only the downsampled ones
 echo "> METAPHYLER"
-samtools view -f 0x4 ${NAME}.bam | awk '{OFS="\t"; print ">"$1"\n"$10}' > ${NAME}.unmapped.fasta
+samtools view -f 0x4 -@ $THREADS $SAMREF ${ALN} | awk '{OFS="\t"; print ">"$1"\n"$10}' > ${NAME}.unmapped.fasta
 ~/apps/Metaphyler/MetaPhylerSRV0.115/metaphyler.pl 2 ${NAME}.unmapped.fasta ${NAME}
 
 
-samtools view -bF 2304 ${NAME}.${downsampling_depth}X.bam > ${NAME}.${downsampling_depth}X.primary.bam
-samtools index ${NAME}.${downsampling_depth}X.primary.bam
+samtools view -bF 2304 -@ $THREADS ${NAME}.${downsampling_depth}X.bam > ${NAME}.${downsampling_depth}X.primary.bam
+samtools index -@ $THREADS ${NAME}.${downsampling_depth}X.primary.bam
 MT_mappedreads=$(samtools idxstats ${NAME}.${downsampling_depth}X.primary.bam | grep -E "$MT_REGEX" | awk '{print $3}')
 mt_perc_totalreads=$(samtools idxstats ${NAME}.${downsampling_depth}X.primary.bam | awk -v mt=$MT_mappedreads '{sum+=($3+$4)}END{print mt/sum*100}')
 unmapped_perc_totalreads=$(samtools idxstats ${NAME}.${downsampling_depth}X.primary.bam | \
