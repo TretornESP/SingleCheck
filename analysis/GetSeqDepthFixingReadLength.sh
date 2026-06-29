@@ -1,11 +1,4 @@
 #!/bin/sh
-#SBATCH -N 1
-#SBATCH -n 1
-#SBATCH --mail-user tamara.prieto.fernandez@gmail.com
-#SBATCH --mail-type FAIL
-#SBATCH --cpus-per-task 1
-#SBATCH -t 00:30:00
-#SBATCH --mem 30G
 
 source ReadConfig.sh $1
 SAMPLE=$(sed "${SLURM_ARRAY_TASK_ID}q;d" ${ORIDIR}/${SAMPLELIST})

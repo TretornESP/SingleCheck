@@ -1,0 +1,141 @@
+#!/bin/bash
+###############################################################################
+# submit -- SLURM submission wrapper for the SingleCheck scripts
+#
+# The pipeline scripts no longer carry embedded #SBATCH directives. This
+# wrapper holds the resource requests in one place and submits any of them with
+# `sbatch`, applying per-script defaults that you can override on the command
+# line or via environment variables.
+#
+# USAGE
+#   ./submit [wrapper options] <script> [-- ] [arguments passed to <script>]
+#
+# WRAPPER OPTIONS (must appear before <script>)
+#   --cpus  <int>        cpus-per-task            (overrides per-script default)
+#   --mem   <size>       memory, e.g. 60G         (overrides per-script default)
+#   --time  <hh:mm:ss>   wall-time limit          (overrides per-script default)
+#   --array <range>      submit as a job array, e.g. 1-96  or 1-96%10
+#   --partition <name>   target partition/queue
+#   --gres  <spec>       generic resources, e.g. gpu:a100:2
+#   --account <name>     accounting project
+#   --qos   <name>       quality of service
+#   --mail  <addr>       send FAIL notifications to this address
+#   --name  <jobname>    SLURM job name (default: the script basename)
+#   --out   <pattern>    stdout/stderr pattern   (default: <name>-%j.out)
+#   --sbatch "<opts>"    extra raw options appended to the sbatch call
+#   --dry-run            print the sbatch command without submitting
+#   --local              run the script directly (no SLURM) for quick testing
+#   -h | --help          show this help
+#
+# EXAMPLES
+#   ./submit SingleCheck -w 10000000 -t 8 sample.bam
+#   ./submit --cpus 16 --mem 120G SingleCheck -r ref.fa s_1.fastq.gz s_2.fastq.gz
+#   ./submit --array 1-96 analysis/SingleCheckArray -w 1000000 Samples.txt .dedup
+#   ./submit --gres gpu:a100:2 --partition gpu SingleCheck -r ref.fa r_1.fastq.gz r_2.fastq.gz
+#   ./submit --dry-run analysis/DownsampleSam.sh in.bam 0.1 150
+###############################################################################
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+usage() { sed -n '2,/^###########/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//;s/^#//'; }
+
+# ---- wrapper-level overrides (empty = use per-script default) ----------------
+CPUS="" ; MEM="" ; TIME="" ; ARRAY="" ; PARTITION="" ; GRES="" ; ACCOUNT=""
+QOS="" ; MAIL="${SINGLECHECK_MAIL:-}" ; JOBNAME="" ; OUTPAT="" ; EXTRA=""
+DRYRUN=0 ; LOCAL=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --cpus)      CPUS="$2"; shift 2 ;;
+    --mem)       MEM="$2"; shift 2 ;;
+    --time)      TIME="$2"; shift 2 ;;
+    --array)     ARRAY="$2"; shift 2 ;;
+    --partition) PARTITION="$2"; shift 2 ;;
+    --gres)      GRES="$2"; shift 2 ;;
+    --account)   ACCOUNT="$2"; shift 2 ;;
+    --qos)       QOS="$2"; shift 2 ;;
+    --mail)      MAIL="$2"; shift 2 ;;
+    --name)      JOBNAME="$2"; shift 2 ;;
+    --out)       OUTPAT="$2"; shift 2 ;;
+    --sbatch)    EXTRA="$2"; shift 2 ;;
+    --dry-run)   DRYRUN=1; shift ;;
+    --local)     LOCAL=1; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    --)          shift; break ;;
+    -*)          printf 'Unknown wrapper option: %s\n\n' "$1" >&2; usage >&2; exit 1 ;;
+    *)           break ;;   # first non-option token is the target script
+  esac
+done
+
+if [ "$#" -lt 1 ]; then
+  printf 'Error: no script specified\n\n' >&2; usage >&2; exit 1
+fi
+
+# ---- resolve the target script ---------------------------------------------
+TARGET="$1"; shift
+if [ ! -f "$TARGET" ]; then
+  for cand in "$HERE/$TARGET" "$HERE/analysis/$TARGET"; do
+    if [ -f "$cand" ]; then TARGET="$cand"; break; fi
+  done
+fi
+if [ ! -f "$TARGET" ]; then
+  printf 'Error: script not found: %s\n' "$TARGET" >&2; exit 1
+fi
+BASENAME="$(basename "$TARGET")"
+
+# ---- per-script default resources (captured from the old #SBATCH headers) ---
+case "$BASENAME" in
+  SingleCheck|SingleCheckArray)   D_CPUS=3; D_TIME=10:00:00; D_MEM=60G  ;;
+  DownsampleSam.sh)               D_CPUS=1; D_TIME=10:00:00; D_MEM=100G ;;
+  SortSam.sh)                     D_CPUS=1; D_TIME=12:00:00; D_MEM=40G  ;;
+  SimulateSingleCellReads.sh)     D_CPUS=1; D_TIME=20:00:00; D_MEM=20G  ;;
+  GetSeqDepth.sh|GetSeqDepthFixingReadLength.sh|CheckSeqDepth.sh|CollectInsertSizeMetrics.sh)
+                                  D_CPUS=1; D_TIME=00:30:00; D_MEM=30G  ;;
+  *)                              D_CPUS=1; D_TIME=01:00:00; D_MEM=8G   ;;
+esac
+
+# apply defaults where the user did not override
+CPUS="${CPUS:-$D_CPUS}"
+TIME="${TIME:-$D_TIME}"
+MEM="${MEM:-$D_MEM}"
+JOBNAME="${JOBNAME:-${BASENAME%.sh}}"
+OUTPAT="${OUTPAT:-${JOBNAME}-%j.out}"
+
+# ---- run locally (no SLURM) -------------------------------------------------
+if [ "$LOCAL" -eq 1 ]; then
+  echo "[local] $TARGET $*" >&2
+  exec "$TARGET" "$@"
+fi
+
+# ---- assemble the sbatch command -------------------------------------------
+SB=(sbatch
+    -N 1 -n 1
+    --cpus-per-task "$CPUS"
+    --mem "$MEM"
+    --time "$TIME"
+    --job-name "$JOBNAME"
+    --output "$OUTPAT")
+
+[ -n "$ARRAY" ]     && SB+=(--array "$ARRAY")
+[ -n "$PARTITION" ] && SB+=(--partition "$PARTITION")
+[ -n "$GRES" ]      && SB+=(--gres "$GRES")
+[ -n "$ACCOUNT" ]   && SB+=(--account "$ACCOUNT")
+[ -n "$QOS" ]       && SB+=(--qos "$QOS")
+[ -n "$MAIL" ]      && SB+=(--mail-user "$MAIL" --mail-type FAIL)
+[ -n "$EXTRA" ]     && SB+=($EXTRA)
+
+SB+=("$TARGET" "$@")
+
+if [ "$DRYRUN" -eq 1 ]; then
+  printf '%q ' "${SB[@]}"; printf '\n'
+  exit 0
+fi
+
+if ! command -v sbatch >/dev/null 2>&1; then
+  printf 'Error: sbatch not found. Use --local to run without SLURM.\n' >&2
+  exit 127
+fi
+
+exec "${SB[@]}"

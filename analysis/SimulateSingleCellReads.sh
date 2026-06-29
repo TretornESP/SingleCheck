@@ -1,11 +1,4 @@
 #!/bin/bash
-#SBATCH -N 1
-#SBATCH -n 1
-#SBATCH --mail-user tamara.prieto.fernandez@gmail.com
-#SBATCH --mail-type FAIL
-#SBATCH --cpus-per-task 1
-#SBATCH -t 20:00:00
-#SBATCH --mem 20G
 
 AMPLICON_LENGTH=$1
 INTERAMPLICON_LENGTH=$2
