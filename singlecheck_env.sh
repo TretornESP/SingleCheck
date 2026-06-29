@@ -17,7 +17,7 @@ module load bedtools/2.31.0 2> /dev/null
 # --- tools not provided as modules: give absolute paths ----------------------
 export MOSDEPTH=/mnt/lustre/scratch/nlsas/home/ulc/cursos/curso385/mosdepth
 export METAPHYLER=/mnt/lustre/scratch/nlsas/home/ulc/cursos/curso385/MetaPhylerV1.13/metaphyler.pl
-
+#cuak
 # If samtools / R / bwa are NOT auto-loaded on this cluster, add their correct
 # module names here as well, e.g.:
 #   module load samtools/1.10 2> /dev/null
