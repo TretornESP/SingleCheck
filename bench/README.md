@@ -43,7 +43,8 @@ bench/bench_stages.sh --help      # all options
 ```
 
 Wrapper options: `-i/--input`, `-I/--input2`, `-r/--reps` (default 3), `-o/--outdir`,
-`-s/--stages`, `-l/--list`, `--warmup`, `--full`, `--env`, `--keep` (default), `--clean`.
+`-s/--stages`, `-l/--list`, `--warmup`, `--full`, `--strict`, `--env`, `--keep` (default),
+`--clean`.
 Pipeline options mirror `SingleCheck`'s flags with long names: `--threads`, `--window`,
 `--delta`, `--depth`, `--ref`, `--flag`, `--mapq`, `--chroms`, `--mt`, `--include-x`,
 `--no-downsample`.
@@ -89,6 +90,23 @@ Inside the results directory (default `bench/stages_<host>_<timestamp>/`):
 | `logs/` | stdout+stderr and `/usr/bin/time -v` output of every single repetition |
 | `work/` | the private working directory with every artifact (deleted with `--clean`) |
 | `state.env` | the variables handed from chunk to chunk (genome length, depth, downsampling fraction …) |
+
+### Dependency check
+
+Before timing anything the script runs **the same dependency check as
+[../SingleCheck](../SingleCheck)** — same module loading (`try_module`, `$BLAST_DIR`), same
+tools and minimum versions, same R-package, helper-script, MetaPhyler/BLAST, reference-index,
+input and scratch checks, same `[ok]`/`[WARN]`/`[MISSING]` output. So the benchmark measures
+the pipeline in the environment the pipeline would actually get, and `$ALIGNER` is picked
+here and used by the `align` chunk exactly as the pipeline does it.
+
+One deliberate difference: a `[MISSING]` does **not** abort. The chunks that need the missing
+tool are reported as `SKIPPED` and everything else is still measured — a partial environment
+should still produce a useful report. Pass `--strict` to abort like `SingleCheck` does.
+
+> The check is a copy of the pipeline's, not a shared library: **if you change one, change the
+> other**. Say the word and I'll factor it into a single `src/check_dependencies.sh` that both
+> source.
 
 ### How it works / what to watch out for
 

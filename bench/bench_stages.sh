@@ -25,6 +25,9 @@
 #       --warmup         one unmeasured warmup repetition per chunk (warms page cache)
 #       --full           ALSO time the whole ../SingleCheck end-to-end, REPS times
 #                        (lets you compare sum-of-chunks against the real total)
+#       --strict         abort when the dependency check finds a problem, exactly
+#                        like ../SingleCheck. Default: report it and measure the
+#                        chunks that CAN run, skipping the rest.
 #       --env  FILE      per-cluster environment file to source (see
 #                        ../singlecheck_env.sh); defaults to $SINGLECHECK_ENV
 #       --keep           keep every intermediate artifact (default)
@@ -83,12 +86,8 @@ ROOTDIR="$(dirname "$BENCHDIR")"      # repo root: holds SingleCheck and src/
 emit() { printf '%s=%q\n' "$1" "$2" >> "$BENCH_VALS"; }
 
 # --- FASTQ input only: alignment ---------------------------------------------
+# $ALIGNER was picked by the dependency check, exactly as in ../SingleCheck.
 stage_align() {
-    if command -v bwa-mem2 >/dev/null 2>&1 && [ -f "${REFERENCE}.bwt.2bit.64" ]; then
-        ALIGNER="bwa-mem2 mem"
-    else
-        ALIGNER="bwa mem"
-    fi
     $ALIGNER \
         -t $THREADS $REFERENCE \
         $FASTQ1 $FASTQ2 | \
@@ -241,8 +240,16 @@ stage_unmapped_fasta() {
     samtools view -f 0x4 -@ $THREADS $SAMREF ${ALN} | awk '{OFS="\t"; print ">"$1"\n"$10}' > ${NAME}.unmapped.fasta
 }
 
+# ../SingleCheck only warns here and carries on with class=NA; the benchmark
+# additionally returns non-zero so the repetition is recorded as FAILED -- the
+# time of a MetaPhyler that died early is not a measurement worth reporting.
 stage_metaphyler() {
-    "$METAPHYLER" 2 ${NAME}.unmapped.fasta ${NAME}
+    if ! "$METAPHYLER" 2 ${NAME}.unmapped.fasta ${NAME} || [ ! -s ${NAME}.genus.tab ]; then
+        printf "\nWarning: MetaPhyler did not produce %s.genus.tab -- the contaminants\n" "${NAME}" >&2
+        printf "         column will be NA. Every other metric is unaffected.\n" >&2
+        printf "         Check the installation at %s\n" "$METAPHYLER" >&2
+        return 1
+    fi
 }
 
 # --- final statistics --------------------------------------------------------
@@ -257,10 +264,10 @@ stage_final_stats() {
     unmapped_perc_totalreads=$(samtools idxstats ${NAME}.${downsampling_depth}X.primary.bam | \
         awk '{mapped+=$3;unmapped+=$4}END{print unmapped/(unmapped+mapped)*100}')
     breadth=$(awk '{if ($1==0){sum+=$3}else if ($1!="NA"){rest+=$3}}END{print 100 - ((sum/(rest+sum))*100)}' ${NAME}.${DELTA}.shiftedcov.txt)
-    if [ -f ${NAME}.genus.tab ]; then
+    if [ -s ${NAME}.genus.tab ]; then
         class=$(awk '{if ($1 !~ "{") print $0}' ${NAME}.genus.tab | grep -v "^@" | awk '{print $1"-"$2"-"$3"-"$4"-"$5}' | tr -s '\n' ',' | sed 's/,$/\n/')
     else
-        class="NA(metaphyler-not-run)"
+        class="NA"
     fi
     SAMPLE=$(basename $NAME)
     WORKDIR=$(dirname "$NAME")
@@ -295,7 +302,7 @@ set -uo pipefail
 #                        3. OPTIONS                                           #
 ###############################################################################
 INPUT="" ; INPUT2="" ; REPS=3 ; OUTDIR="" ; STAGES_CSV="" ; LIST=0
-WARMUP=0 ; FULL=0 ; CLEAN=0 ; ENVFILE="${SINGLECHECK_ENV:-}"
+WARMUP=0 ; FULL=0 ; CLEAN=0 ; STRICT=0 ; ENVFILE="${SINGLECHECK_ENV:-}"
 
 # pipeline defaults -- kept identical to ../SingleCheck
 WSIZE=10000000
@@ -320,6 +327,7 @@ while [ "$#" -gt 0 ]; do
     -l|--list)       LIST=1; shift ;;
     --warmup)        WARMUP=1; shift ;;
     --full)          FULL=1; shift ;;
+    --strict)        STRICT=1; shift ;;
     --env)           ENVFILE="$2"; shift 2 ;;
     --keep)          CLEAN=0; shift ;;
     --clean)         CLEAN=1; shift ;;
@@ -390,22 +398,46 @@ fi
 # unset variables, which would abort a `set -u` shell.                        #
 ###############################################################################
 set +u
-module purge 2> /dev/null
-module load samtools/1.10 2> /dev/null
-module load gcc/6.4.0 R/3.6.3 2> /dev/null
-module load miniconda3/4.8.2 2> /dev/null
-module load gcccore/6.4.0 bedtools/2.28.0 2> /dev/null
-module load gcccore/6.4.0 bwa-mem2/2.0 2> /dev/null
-module load gcc/6.4.0 bwa/0.7.17 2> /dev/null
-module load picard/2.18.14 2> /dev/null
+MODULES_LOADED=""
+MODULES_FAILED=""
+HAVE_MODULE=0
+type module >/dev/null 2>&1 && HAVE_MODULE=1
+
+# try_module <spec> [alternative spec ...] -- same helper as ../SingleCheck
+try_module() {
+    local spec
+    [ "$HAVE_MODULE" -eq 1 ] || return 1
+    for spec in "$@"; do
+        if module load $spec 2>/dev/null; then
+            MODULES_LOADED="${MODULES_LOADED} ${spec}"
+            return 0
+        fi
+    done
+    MODULES_FAILED="${MODULES_FAILED} $1"
+    return 1
+}
+
+[ "$HAVE_MODULE" -eq 1 ] && module purge 2> /dev/null
+try_module samtools/1.10 samtools
+try_module "gcc/6.4.0 R/3.6.3" R
+try_module miniconda3/4.8.2 miniconda3
+try_module "gcccore/6.4.0 bedtools/2.28.0" bedtools
+try_module "gcccore/6.4.0 bwa-mem2/2.0" bwa-mem2
+try_module "gcc/6.4.0 bwa/0.7.17" bwa
+try_module blast-plus blast blast+ ncbi-blast blast-legacy
 source activate /mnt/netapp1/posadalab/APPS/CommonCondaEnvironments/mosdepth 2> /dev/null
 
 if [ -n "$ENVFILE" ] && [ -f "$ENVFILE" ]; then source "$ENVFILE"; fi
 set -u
 
-# MetaPhyler looks BLAST up on $PATH by name -- same handling as ../SingleCheck.
-if [ -n "${BLAST_DIR:-}" ] && [ -d "$BLAST_DIR" ]; then
-  case ":$PATH:" in *":$BLAST_DIR:"*) ;; *) PATH="$BLAST_DIR:$PATH"; export PATH ;; esac
+# MetaPhyler looks BLAST up on $PATH by name, so $BLAST_DIR is a DIRECTORY that
+# gets prepended to $PATH -- same handling as ../SingleCheck.
+if [ -n "${BLAST_DIR:-}" ]; then
+  if [ -d "$BLAST_DIR" ]; then
+    case ":$PATH:" in *":$BLAST_DIR:"*) ;; *) PATH="$BLAST_DIR:$PATH"; export PATH ;; esac
+  else
+    printf "\nWarning: \$BLAST_DIR=%s is not a directory -- ignored\n" "$BLAST_DIR" >&2
+  fi
 fi
 
 MOSDEPTH="${MOSDEPTH:-mosdepth}"
@@ -467,6 +499,331 @@ case "$ALN" in
   *)      ALNIDX="${ALN}.bai"  ;;
 esac
 
+###############################################################################
+#              5b. DEPENDENCY CHECK -- mirrors ../SingleCheck                  #
+#                                                                             #
+# Same checks, same messages, same order as the CHECK DEPENDENCIES section of  #
+# ../SingleCheck, so the benchmark runs in exactly the environment the         #
+# pipeline would. KEEP THE TWO IN SYNC when either changes.                    #
+#                                                                             #
+# Difference: a missing tool does not abort here by default -- the chunks that #
+# need it are reported as SKIPPED and everything else is still measured, which #
+# is the point of a benchmark. Use --strict to abort like ../SingleCheck does. #
+###############################################################################
+echo "> Checking dependencies"
+missing=0
+warnings=0
+
+err()   { printf "  [MISSING] %s\n" "$1" >&2; missing=$((missing+1)); }
+warn()  { printf "  [WARN]    %s\n" "$1" >&2; warnings=$((warnings+1)); }
+found() { printf "  [ok]      %s\n" "$1"; }
+
+have()    { command -v "$1" >/dev/null 2>&1 || [ -x "$1" ]; }
+resolve() { command -v "$1" 2>/dev/null || printf '%s\n' "$1"; }
+
+version_ge() {
+    awk -v a="$1" -v b="$2" 'BEGIN{
+        na=split(a,A,"."); nb=split(b,B,"."); n=(na>nb?na:nb)
+        for(i=1;i<=n;i++){ x=A[i]+0; y=B[i]+0; if(x>y) exit 0; if(x<y) exit 1 }
+        exit 0}'
+}
+
+require_tool() {
+    local handle="$1" pretty="$2" minv="$3" hint="$4"; shift 4
+    local path out ver
+    if ! have "$handle"; then
+        err "$pretty not found (looked for '$handle')${hint:+ -- $hint}"
+        return 1
+    fi
+    path="$(resolve "$handle")"
+    if ! out="$("$@" 2>&1)"; then
+        err "$pretty found at $path but does not run${hint:+ -- $hint}"
+        printf "%s\n" "$out" | head -n 3 | sed 's/^/            /' >&2
+        return 1
+    fi
+    if [ "$minv" = "-" ]; then
+        found "$pretty ($path)"
+        return 0
+    fi
+    ver=$(printf "%s\n" "$out" | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1)
+    if [ -z "$ver" ]; then
+        warn "could not determine the version of $pretty at $path (need >= $minv)"
+        found "$pretty (unknown version, $path)"
+    elif version_ge "$ver" "$minv"; then
+        found "$pretty $ver ($path)"
+    else
+        err "$pretty $ver at $path is too old, need >= $minv${hint:+ -- $hint}"
+    fi
+}
+
+# --- environment modules -----------------------------------------------------
+if [ "$HAVE_MODULE" -eq 1 ]; then
+    [ -n "$MODULES_LOADED" ] && found "modules loaded:$MODULES_LOADED"
+    if [ -n "$MODULES_FAILED" ]; then
+        if [ -n "${SINGLECHECK_STRICT_MODULES:-}" ]; then
+            err "module(s) not available on this cluster:$MODULES_FAILED (SINGLECHECK_STRICT_MODULES=1)"
+        else
+            warn "module(s) not available on this cluster:$MODULES_FAILED -- only a problem if a tool below is missing"
+        fi
+    fi
+else
+    warn "no 'module' command available -- every tool must be on \$PATH or set in \$SINGLECHECK_ENV"
+fi
+
+# --- shell / coreutils helpers the chunks pipe data through ------------------
+core_missing=""
+for c in grep sed awk sort uniq cut head tail paste tr wc zcat gzip ln readlink basename dirname df; do
+    have "$c" || core_missing="$core_missing $c"
+done
+if [ -n "$core_missing" ]; then
+    err "basic shell utilities not found on \$PATH:$core_missing"
+else
+    found "shell utilities (grep sed awk sort uniq cut head tail paste tr wc zcat gzip)"
+fi
+
+if have sort; then
+    if printf '' | sort --parallel=2 --compress-program="$SORTCOMP" -T "$SCRATCH" --version-sort >/dev/null 2>&1; then
+        found "GNU sort (--parallel, --compress-program=$SORTCOMP, --version-sort)"
+    else
+        err "'sort' at $(resolve sort) does not support --parallel / --compress-program=$SORTCOMP / --version-sort (GNU coreutils sort required)"
+    fi
+fi
+
+if ! have bc; then
+    err "command 'bc' not found on \$PATH (needed for the downsampling probability)"
+elif [ -z "$(printf 'scale=10; 1/3\n' | bc -l 2>/dev/null)" ]; then
+    err "'bc' at $(resolve bc) is present but produced no output for a test computation"
+else
+    found "bc ($(resolve bc))"
+fi
+
+# --- the tools the chunks actually measure -----------------------------------
+require_tool samtools "samtools" 1.9 \
+    "module load samtools/1.10" \
+    samtools --version
+require_tool "$BEDTOOLS" "bedtools" 2.25 \
+    "module load bedtools, or set BEDTOOLS=/path/to/bedtools in \$SINGLECHECK_ENV" \
+    "$BEDTOOLS" --version
+require_tool "$MOSDEPTH" "mosdepth" 0.2.5 \
+    "activate the mosdepth conda env, or set MOSDEPTH=/path/to/mosdepth in \$SINGLECHECK_ENV" \
+    "$MOSDEPTH" --version
+require_tool Rscript "R (Rscript)" 3.5 \
+    "module load R" \
+    Rscript --version
+
+# The compressor matters for the timings: say which one the chunks will use.
+have pigz  || have bgzip || warn "neither pigz nor bgzip found -- shift_track will be timed with single-threaded gzip"
+have zstd  || warn "zstd not found -- sort spill files will be compressed with $SORTCOMP"
+
+# --- R packages used by the four metric scripts ------------------------------
+if have Rscript; then
+    rmissing=$(Rscript -e 'p <- c("tidyr","dplyr","matrixStats"); m <- p[!sapply(p, requireNamespace, quietly=TRUE)]; cat(paste(m, collapse=" "))' 2>/dev/null)
+    rrc=$?
+    if [ "$rrc" -ne 0 ]; then
+        err "could not query the R library (Rscript exited $rrc) -- check the R module/installation"
+    elif [ -n "$rmissing" ]; then
+        err "R package(s) not installed: $rmissing -- install.packages(c(\"tidyr\",\"dplyr\",\"matrixStats\"))"
+    else
+        found "R packages tidyr, dplyr, matrixStats"
+    fi
+fi
+
+# --- helper scripts shipped with the pipeline --------------------------------
+if [ ! -d "$SRCDIR" ]; then
+    err "helper directory $SRCDIR not found -- bench/ must sit next to the pipeline's src/ folder"
+else
+    rs_missing=""
+    for rs in GiniIndex.R CoefficientOfVariation.R Autocorrelation.R MAD.R; do
+        [ -r "${SRCDIR}/${rs}" ] || rs_missing="$rs_missing $rs"
+    done
+    if [ -n "$rs_missing" ]; then
+        err "helper script(s) missing or unreadable in ${SRCDIR}:$rs_missing"
+    else
+        found "helper R scripts ($SRCDIR)"
+    fi
+fi
+
+# --- Metaphyler, the BLAST it shells out to, and its own internal paths ------
+if [ ! -f "$METAPHYLER" ]; then
+    err "Metaphyler not found at $METAPHYLER (set \$METAPHYLER to the full path of metaphyler.pl)"
+elif [ ! -x "$METAPHYLER" ]; then
+    err "Metaphyler at $METAPHYLER is not executable (chmod +x it)"
+else
+    have perl || err "perl not found on \$PATH (needed to run $METAPHYLER)"
+    found "Metaphyler ($METAPHYLER)"
+
+    blast_wanted=$(grep -ohE '\b(blastall|blastn|blastx|blastp|tblastn|megablast)\b' "$METAPHYLER" 2>/dev/null | sort -u)
+    blast_guessed=0
+    if [ -z "$blast_wanted" ]; then
+        blast_wanted="blastall blastn"
+        blast_guessed=1
+    fi
+    blast_have="" ; blast_first="" ; blast_miss=""
+    for b in $blast_wanted; do
+        if have "$b"; then
+            blast_have="$blast_have $b"
+            [ -n "$blast_first" ] || blast_first="$(resolve "$b")"
+        else
+            blast_miss="$blast_miss $b"
+        fi
+    done
+    if [ -n "$blast_have" ]; then
+        found "BLAST:$blast_have ($blast_first)"
+        if [ -n "$blast_miss" ] && [ "$blast_guessed" -eq 0 ]; then
+            warn "$(basename "$METAPHYLER") also refers to:$blast_miss -- not on \$PATH"
+        fi
+    elif [ "$blast_guessed" -eq 1 ]; then
+        err "no BLAST on \$PATH (MetaPhyler needs 'blastall' for legacy BLAST or 'blastn' for BLAST+) -- module load blast, or set BLAST_DIR=/path/to/blast/bin in \$SINGLECHECK_ENV"
+    else
+        err "no BLAST on \$PATH, but $(basename "$METAPHYLER") calls:$blast_miss -- module load blast (conda: 'blast-legacy' provides blastall, 'blast' provides blastn), or set BLAST_DIR=/path/to/blast/bin in \$SINGLECHECK_ENV"
+    fi
+
+    METADIR=$(dirname "$METAPHYLER")
+    mp_missing=""
+    for helper in $(grep -ohE '/[A-Za-z0-9_./-]+\.pl' "$METAPHYLER" 2>/dev/null | sort -u); do
+        [ "$helper" = "$METAPHYLER" ] && continue
+        root="/$(printf '%s' "$helper" | cut -d/ -f2)"
+        [ -d "$root" ] || continue
+        [ -e "$helper" ] || mp_missing="$mp_missing $helper"
+    done
+    if [ -n "$mp_missing" ]; then
+        err "MetaPhyler refers to helper script(s) that do not exist:$mp_missing"
+        printf "            metaphyler.pl has its install path baked in, so the installation was\n" >&2
+        printf "            moved or copied. Re-install it where it lives now:\n" >&2
+        printf "                cd %s && perl installMetaphyler.pl\n" "$METADIR" >&2
+    fi
+    if [ ! -d "${METADIR}/markers" ]; then
+        warn "MetaPhyler marker directory ${METADIR}/markers not found -- classification may fail"
+    elif [ -z "$(ls "${METADIR}"/markers/*hr 2>/dev/null | head -n1)" ]; then
+        warn "no formatted BLAST database in ${METADIR}/markers -- run: perl ${METADIR}/installMetaphyler.pl"
+    else
+        found "MetaPhyler marker database (${METADIR}/markers)"
+    fi
+fi
+
+# --- aligner + its reference index (FASTQ input only) ------------------------
+# $ALIGNER is chosen here and used by the align chunk, exactly as ../SingleCheck
+# chooses it in its dependency check and uses it in the mapping step.
+ALIGNER=""
+if [ "$METHOD" = "Paired-end" ] || [ "$METHOD" = "Single-end" ]; then
+    [ -n "$REFERENCE" ] || err "FASTQ input requires a reference genome (--ref ref.fa)"
+    if command -v bwa-mem2 >/dev/null 2>&1 && [ -n "$REFERENCE" ] && [ -f "${REFERENCE}.bwt.2bit.64" ]; then
+        ALIGNER="bwa-mem2 mem"
+        idx_missing=""
+        for ext in 0123 amb ann bwt.2bit.64 pac; do
+            [ -f "${REFERENCE}.${ext}" ] || idx_missing="$idx_missing ${REFERENCE}.${ext}"
+        done
+        if [ -n "$idx_missing" ]; then
+            err "incomplete bwa-mem2 index (missing:$idx_missing) -- run: bwa-mem2 index $REFERENCE"
+        else
+            found "aligner bwa-mem2 ($(resolve bwa-mem2)) + its index"
+        fi
+    elif command -v bwa >/dev/null 2>&1; then
+        ALIGNER="bwa mem"
+        if [ -n "$REFERENCE" ]; then
+            idx_missing=""
+            for ext in amb ann bwt pac sa; do
+                [ -f "${REFERENCE}.${ext}" ] || idx_missing="$idx_missing ${REFERENCE}.${ext}"
+            done
+            if [ -n "$idx_missing" ]; then
+                err "incomplete bwa index (missing:$idx_missing) -- run: bwa index $REFERENCE"
+            else
+                found "aligner bwa ($(resolve bwa)) + its index"
+            fi
+        fi
+    else
+        err "no aligner on \$PATH (need bwa-mem2 or bwa) -- module load bwa-mem2 / bwa"
+    fi
+fi
+
+# --- reference genome --------------------------------------------------------
+if [ -n "$REFERENCE" ]; then
+    if [ ! -f "$REFERENCE" ]; then
+        err "reference fasta not found: $REFERENCE"
+    elif [ ! -r "$REFERENCE" ]; then
+        err "reference fasta not readable: $REFERENCE"
+    elif [ ! -f "${REFERENCE}.fai" ]; then
+        err "samtools faidx index missing: ${REFERENCE}.fai -- run: samtools faidx $REFERENCE"
+    else
+        found "reference $REFERENCE (+ .fai)"
+    fi
+fi
+
+# --- input file(s) and index -------------------------------------------------
+if [ "$METHOD" = "Aligned" ]; then
+    if [ ! -r "$ALN" ]; then
+        err "input file not readable: $ALN"
+    elif [ ! -s "$ALN" ]; then
+        err "input file is empty: $ALN"
+    else
+        if have samtools && ! samtools quickcheck "$ALN" >/dev/null 2>&1; then
+            if [[ "$ALN" == *.cram ]]; then
+                warn "samtools quickcheck is unhappy about $ALN -- check the file and its reference"
+            else
+                err "$ALN is not a valid/complete BAM (samtools quickcheck failed: truncated or not a BAM?)"
+            fi
+        fi
+        if [ ! -f "$ALNIDX" ]; then
+            err "index missing: $ALNIDX -- run: samtools index $ABS_INPUT"
+        else
+            [ "$ALNIDX" -ot "$ALN" ] && warn "index $ALNIDX is older than $ALN -- consider re-running samtools index"
+            found "input $ABS_INPUT (+ index, symlinked into work/)"
+        fi
+    fi
+else
+    for fq in "$FASTQ1" "$FASTQ2"; do
+        [ -n "$fq" ] || continue
+        if [ ! -r "$fq" ]; then
+            err "FASTQ not readable: $fq"
+        elif [ ! -s "$fq" ]; then
+            err "FASTQ is empty: $fq"
+        else
+            found "input $fq"
+        fi
+    done
+fi
+
+# --- directories ------------------------------------------------------------
+if [ -d "$WORK" ] && [ -w "$WORK" ]; then
+    found "working directory $WORK is writable"
+else
+    err "working directory $WORK is not writable"
+fi
+if [ -d "$SCRATCH" ] && [ -w "$SCRATCH" ]; then
+    found "scratch directory $SCRATCH is writable"
+else
+    err "scratch directory $SCRATCH does not exist or is not writable (set \$TMPDIR)"
+fi
+
+if have df; then
+    free_kb=$(df -Pk "$SCRATCH" 2>/dev/null | awk 'NR==2{print $4}')
+    case "$free_kb" in
+        ''|*[!0-9]*) : ;;
+        *) [ "$free_kb" -lt 5000000 ] && warn "only $((free_kb/1024)) MB free in $SCRATCH -- the sort step may run out of space" ;;
+    esac
+fi
+
+# Oversubscribed threads would make every timing meaningless, so this one is
+# worth more here than in the pipeline itself.
+ncpus="${SLURM_CPUS_PER_TASK:-$(nproc 2>/dev/null || echo 0)}"
+case "$ncpus" in ''|*[!0-9]*) ncpus=0 ;; esac
+if [ "$ncpus" -gt 0 ] && [ "$THREADS" -gt "$ncpus" ]; then
+    warn "--threads $THREADS is larger than the $ncpus CPU(s) available -- timings will be distorted"
+fi
+
+# --- verdict ----------------------------------------------------------------
+if [ "$missing" -ne 0 ]; then
+    if [ "$STRICT" -eq 1 ]; then
+        printf "\nError: %d dependency problem(s) found (see the [MISSING] lines above).\nAborting (--strict).\n" "$missing" >&2
+        exit 1
+    fi
+    printf "  %d dependency problem(s): the chunks that need them will be reported as SKIPPED\n" "$missing"
+    printf "  (run with --strict to abort instead, like ../SingleCheck does)\n"
+fi
+[ "$warnings" -ne 0 ] && printf "  %d warning(s) -- continuing\n" "$warnings"
+[ "$missing" -eq 0 ] && echo "  all dependencies OK"
+echo
+
 # values filled in by the chunks themselves
 genome_length="" ; raw_reads="" ; mean_readlength="" ; raw_bases=""
 sequencing_depth="" ; probability="" ; DEPTH="" ; DS_MODE=""
@@ -474,7 +831,7 @@ sequencing_depth="" ; probability="" ; DEPTH="" ; DS_MODE=""
 STATE_VARS=(FILE FASTQ1 FASTQ2 METHOD NAME ALN ALNIDX SAMREF REFERENCE THREADS
             WSIZE DELTA FLAGTOFILTEROUT MAPQUAL DIPLOID_REGEX MT_REGEX
             downsampling_depth ds_strategy DOWNSAMPLE SCRATCH SORTCOMP GZIP_CMD
-            MOSDEPTH BEDTOOLS METAPHYLER SRCDIR WORK BENCH_VALS
+            MOSDEPTH BEDTOOLS METAPHYLER SRCDIR WORK BENCH_VALS ALIGNER
             genome_length raw_reads mean_readlength raw_bases sequencing_depth
             probability DEPTH DS_MODE)
 
@@ -555,9 +912,9 @@ declare -a RUN_KEYS=()
 if [ -n "$STAGES_CSV" ]; then
   IFS=',' read -r -a want <<< "$STAGES_CSV"
   for k in "${want[@]}"; do
-    found=0
-    for kk in "${STAGE_KEYS[@]}"; do [ "$k" = "$kk" ] && found=1 && break; done
-    [ "$found" -eq 1 ] || { echo "Error: unknown chunk '$k' (see --list)" >&2; exit 1; }
+    stage_found=0
+    for kk in "${STAGE_KEYS[@]}"; do [ "$k" = "$kk" ] && stage_found=1 && break; done
+    [ "$stage_found" -eq 1 ] || { echo "Error: unknown chunk '$k' (see --list)" >&2; exit 1; }
     RUN_KEYS+=("$k")
   done
 else
@@ -714,6 +1071,7 @@ fi
   echo "| cpus available | $(nproc 2>/dev/null || echo '?') |"
   echo "| input | \`$ABS_INPUT\` (${INPUT_SIZE:-?}, $METHOD) |"
   echo "| repetitions | $REPS $([ "$WARMUP" -eq 1 ] && echo '(+1 warmup, not measured)') |"
+  echo "| dependency check | $missing problem(s), $warnings warning(s) |"
   echo "| threads (-t) | $THREADS |"
   echo "| window (-w) | $WSIZE |"
   echo "| delta (-i) | $DELTA |"
