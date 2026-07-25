@@ -403,6 +403,11 @@ source activate /mnt/netapp1/posadalab/APPS/CommonCondaEnvironments/mosdepth 2> 
 if [ -n "$ENVFILE" ] && [ -f "$ENVFILE" ]; then source "$ENVFILE"; fi
 set -u
 
+# MetaPhyler looks BLAST up on $PATH by name -- same handling as ../SingleCheck.
+if [ -n "${BLAST_DIR:-}" ] && [ -d "$BLAST_DIR" ]; then
+  case ":$PATH:" in *":$BLAST_DIR:"*) ;; *) PATH="$BLAST_DIR:$PATH"; export PATH ;; esac
+fi
+
 MOSDEPTH="${MOSDEPTH:-mosdepth}"
 BEDTOOLS="${BEDTOOLS:-bedtools}"
 METAPHYLER="${METAPHYLER:-$HOME/apps/Metaphyler/MetaPhylerSRV0.115/metaphyler.pl}"
@@ -627,6 +632,11 @@ for key in "${RUN_KEYS[@]}"; do
   if [ "$key" = "align" ]; then
     command -v bwa-mem2 >/dev/null 2>&1 || command -v bwa >/dev/null 2>&1 || miss="$miss bwa/bwa-mem2"
     [ -n "$REFERENCE" ] || miss="$miss --ref"
+  fi
+  if [ "$key" = "metaphyler" ]; then
+    # MetaPhyler shells out to BLAST (legacy blastall or BLAST+ blastn)
+    command -v perl >/dev/null 2>&1 || miss="$miss perl"
+    command -v blastall >/dev/null 2>&1 || command -v blastn >/dev/null 2>&1 || miss="$miss blastall/blastn"
   fi
   if [ -n "$miss" ]; then skip_stage "$key" "missing tool(s):$miss"; continue; fi
 

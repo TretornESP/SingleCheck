@@ -11,8 +11,13 @@
 * [mosdepth](https://github.com/brentp/mosdepth) &#8805; 0.2.5
 * [bedtools](https://bedtools.readthedocs.io/en/latest/) &#8805; 2.25
 * [BWA-MEM](https://github.com/lh3/bwa) or [bwa-mem2](https://github.com/bwa-mem2/bwa-mem2) (only for FASTQ input)
-* [MetaPhyler](http://metaphyler.cbcb.umd.edu/) plus `perl` and `blastn`/`blastall`
+* [MetaPhyler](http://metaphyler.cbcb.umd.edu/) plus `perl`
   (set `$METAPHYLER` to the full path of its `metaphyler.pl`)
+* [BLAST](https://blast.ncbi.nlm.nih.gov/) — MetaPhyler shells out to it. MetaPhyler V1.13
+  drives **legacy** BLAST (`blastall`, conda: `blast-legacy`); BLAST+ (`blastn`) works only
+  if the marker database was re-formatted with `makeblastdb`. Because MetaPhyler looks BLAST
+  up on `$PATH` by name, point `$BLAST_DIR` at the directory holding the binary rather than
+  at the binary itself
 * GNU coreutils (`sort` with `--parallel` / `--compress-program` / `--version-sort`) and `bc`
 * optional, for speed: `pigz` or `bgzip`, and `zstd`
 * R &#8805; 3.5 with the packages for the main program:

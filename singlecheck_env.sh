@@ -14,9 +14,22 @@
 # --- modules available on this cluster (CESGA / FinisTerrae) -----------------
 module load bedtools/2.31.0 2> /dev/null
 
+# BLAST for MetaPhyler. Find the right name with `module spider blast`.
+# MetaPhylerV1.13 drives LEGACY blast (blastall); BLAST+ (blastn/blastx) needs
+# the marker database to be re-formatted with makeblastdb.
+#module load blast-plus/2.11.0 2> /dev/null
+
 # --- tools not provided as modules: give absolute paths ----------------------
 export MOSDEPTH=/mnt/lustre/scratch/nlsas/home/ulc/cursos/curso385/mosdepth
 export METAPHYLER=/mnt/lustre/scratch/nlsas/home/ulc/cursos/curso385/MetaPhylerV1.13/metaphyler.pl
+
+# BLAST is looked up on $PATH by MetaPhyler itself, so an absolute path to the
+# binary would not help: give the DIRECTORY that holds blastall / blastn and
+# SingleCheck prepends it to $PATH. Create one with, for example:
+#   conda create -y -p /mnt/lustre/scratch/nlsas/home/ulc/cursos/curso385/blast-legacy \
+#       -c bioconda blast-legacy          # blastall + formatdb (MetaPhyler 1.13)
+#   conda create -y -p .../blast -c bioconda blast    # BLAST+: blastn, makeblastdb
+#export BLAST_DIR=/mnt/lustre/scratch/nlsas/home/ulc/cursos/curso385/blast-legacy/bin
 #cuak
 # If samtools / R / bwa are NOT auto-loaded on this cluster, add their correct
 # module names here as well, e.g.:

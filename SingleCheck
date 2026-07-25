@@ -238,6 +238,8 @@ fi
 	try_module "gcccore/6.4.0 bedtools/2.28.0" bedtools
 	try_module "gcccore/6.4.0 bwa-mem2/2.0" bwa-mem2
 	try_module "gcc/6.4.0 bwa/0.7.17" bwa
+	# BLAST is not called by this script, but MetaPhyler shells out to it.
+	try_module blast-plus blast blast+ ncbi-blast blast-legacy
 	# Picard is no longer used (DownsampleSam was replaced by `samtools view -s`,
 	# see HPC_OPTIMIZATION.md item 2), so no picard module is required.
         source activate /mnt/netapp1/posadalab/APPS/CommonCondaEnvironments/mosdepth 2> /dev/null
@@ -254,6 +256,20 @@ fi
         # the config / environment (for tools not provided as modules).
         MOSDEPTH="${MOSDEPTH:-mosdepth}"
         BEDTOOLS="${BEDTOOLS:-bedtools}"
+
+        # BLAST cannot be handled the same way: MetaPhyler runs it by name, so
+        # an absolute path would not help. Point $BLAST_DIR at the directory
+        # holding blastall / blastn and it is prepended to $PATH instead.
+        if [ -n "${BLAST_DIR:-}" ]; then
+            if [ -d "$BLAST_DIR" ]; then
+                case ":$PATH:" in
+                    *":$BLAST_DIR:"*) ;;
+                    *) PATH="$BLAST_DIR:$PATH"; export PATH ;;
+                esac
+            else
+                printf "\nWarning: \$BLAST_DIR=%s is not a directory -- ignored\n" "$BLAST_DIR" >&2
+            fi
+        fi
 
 ############################################################################
 #                        HPC ENVIRONMENT TUNING                            #
@@ -460,7 +476,7 @@ else
     fi
 fi
 
-# --- Metaphyler (contamination detection) ------------------------------------
+# --- Metaphyler (contamination detection) and the BLAST it shells out to -----
 if [ ! -f "$METAPHYLER" ]; then
     err "Metaphyler not found at $METAPHYLER (set \$METAPHYLER to the full path of metaphyler.pl)"
 elif [ ! -x "$METAPHYLER" ]; then
@@ -469,10 +485,52 @@ else
     if ! have perl; then
         err "perl not found on \$PATH (needed to run $METAPHYLER)"
     fi
-    if ! have blastall && ! have blastn; then
-        warn "neither blastall nor blastn on \$PATH -- Metaphyler classification is likely to fail"
-    fi
     found "Metaphyler ($METAPHYLER)"
+
+    # MetaPhyler classifies the unmapped reads with BLAST, which it looks up on
+    # $PATH by name. Ask the script itself which binaries it calls: legacy BLAST
+    # (blastall) and BLAST+ (blastn/blastx) are NOT interchangeable, and the
+    # marker database has to be formatted for whichever one is installed.
+    blast_wanted=$(grep -ohE '\b(blastall|blastn|blastx|blastp|tblastn|megablast)\b' "$METAPHYLER" 2>/dev/null | sort -u)
+    blast_guessed=0
+    if [ -z "$blast_wanted" ]; then          # could not tell: accept either flavour
+        blast_wanted="blastall blastn"
+        blast_guessed=1
+    fi
+    blast_have=""
+    blast_first=""
+    blast_miss=""
+    for b in $blast_wanted; do
+        if have "$b"; then
+            blast_have="$blast_have $b"
+            [ -n "$blast_first" ] || blast_first="$(resolve "$b")"
+        else
+            blast_miss="$blast_miss $b"
+        fi
+    done
+    if [ -n "$blast_have" ]; then
+        found "BLAST:$blast_have ($blast_first)"
+        # Only a warning: the name may come from a comment or from a code path
+        # this pipeline never reaches.
+        if [ -n "$blast_miss" ] && [ "$blast_guessed" -eq 0 ]; then
+            warn "$(basename "$METAPHYLER") also refers to:$blast_miss -- not on \$PATH"
+        fi
+    elif [ "$blast_guessed" -eq 1 ]; then
+        err "no BLAST on \$PATH (MetaPhyler needs 'blastall' for legacy BLAST or 'blastn' for BLAST+) -- module load blast, or set BLAST_DIR=/path/to/blast/bin in \$SINGLECHECK_ENV"
+    else
+        err "no BLAST on \$PATH, but $(basename "$METAPHYLER") calls:$blast_miss -- module load blast (conda: 'blast-legacy' provides blastall, 'blast' provides blastn), or set BLAST_DIR=/path/to/blast/bin in \$SINGLECHECK_ENV"
+    fi
+
+    # The marker gene database must sit next to the script and be formatted for
+    # the installed BLAST -- that is what installMetaphyler.pl does.
+    METADIR=$(dirname "$METAPHYLER")
+    if [ ! -d "${METADIR}/markers" ]; then
+        warn "MetaPhyler marker directory ${METADIR}/markers not found -- classification may fail"
+    elif [ -z "$(ls "${METADIR}"/markers/*hr 2>/dev/null | head -n1)" ]; then
+        warn "no formatted BLAST database in ${METADIR}/markers -- run: perl ${METADIR}/installMetaphyler.pl"
+    else
+        found "MetaPhyler marker database (${METADIR}/markers)"
+    fi
 fi
 
 # --- aligner + its reference index (FASTQ input only) ------------------------
