@@ -521,9 +521,32 @@ else
         err "no BLAST on \$PATH, but $(basename "$METAPHYLER") calls:$blast_miss -- module load blast (conda: 'blast-legacy' provides blastall, 'blast' provides blastn), or set BLAST_DIR=/path/to/blast/bin in \$SINGLECHECK_ENV"
     fi
 
+    METADIR=$(dirname "$METAPHYLER")
+
+    # installMetaphyler.pl bakes the installation directory into metaphyler.pl.
+    # If the tree is later moved or copied, the script keeps pointing at the old
+    # location and dies at the very END of a multi-hour run ("Can't exec
+    # .../src/metaphylerClassify.pl"). Verify those helper scripts now.
+    mp_missing=""
+    for helper in $(grep -ohE '/[A-Za-z0-9_./-]+\.pl' "$METAPHYLER" 2>/dev/null | sort -u); do
+        [ "$helper" = "$METAPHYLER" ] && continue
+        # Skip matches that are really "$var/src/foo.pl": if the first component
+        # is not a real directory the path was interpolated at run time and
+        # cannot be checked from here.
+        root="/$(printf '%s' "$helper" | cut -d/ -f2)"
+        [ -d "$root" ] || continue
+        [ -e "$helper" ] || mp_missing="$mp_missing $helper"
+    done
+    if [ -n "$mp_missing" ]; then
+        err "MetaPhyler refers to helper script(s) that do not exist:$mp_missing"
+        printf "            metaphyler.pl has its install path baked in, so the installation was\n" >&2
+        printf "            moved or copied. Re-install it where it lives now:\n" >&2
+        printf "                cd %s && perl installMetaphyler.pl\n" "$METADIR" >&2
+        printf "            or rewrite the old prefix inside %s\n" "$METAPHYLER" >&2
+    fi
+
     # The marker gene database must sit next to the script and be formatted for
     # the installed BLAST -- that is what installMetaphyler.pl does.
-    METADIR=$(dirname "$METAPHYLER")
     if [ ! -d "${METADIR}/markers" ]; then
         warn "MetaPhyler marker directory ${METADIR}/markers not found -- classification may fail"
     elif [ -z "$(ls "${METADIR}"/markers/*hr 2>/dev/null | head -n1)" ]; then
@@ -829,7 +852,11 @@ Rscript ${SCRIPTDIR}/src/MAD.R ${NAME}.${WSIZE}
 # Run Metaphyler on all unmapped reads, not only the downsampled ones
 echo "> METAPHYLER"
 samtools view -f 0x4 -@ $THREADS $SAMREF ${ALN} | awk '{OFS="\t"; print ">"$1"\n"$10}' > ${NAME}.unmapped.fasta
-"$METAPHYLER" 2 ${NAME}.unmapped.fasta ${NAME}
+if ! "$METAPHYLER" 2 ${NAME}.unmapped.fasta ${NAME} || [ ! -s ${NAME}.genus.tab ]; then
+    printf "\nWarning: MetaPhyler did not produce %s.genus.tab -- the contaminants\n" "${NAME}" >&2
+    printf "         column will be NA. Every other metric is unaffected.\n" >&2
+    printf "         Check the installation at %s\n" "$METAPHYLER" >&2
+fi
 
 
 samtools view -bF 2304 -@ $THREADS ${NAME}.${downsampling_depth}X.bam > ${NAME}.${downsampling_depth}X.primary.bam
@@ -840,7 +867,11 @@ unmapped_perc_totalreads=$(samtools idxstats ${NAME}.${downsampling_depth}X.prim
         awk '{mapped+=$3;unmapped+=$4}END{print unmapped/(unmapped+mapped)*100}')
 #breadth=$(awk -v gl=$genome_length '{if ($1==0){sum+=$3}}END{print (1 - sum/gl)*100}' ${NAME}.${DELTA}.shiftedcov.txt)
 breadth=$(awk '{if ($1==0){sum+=$3}else if ($1!="NA"){rest+=$3}}END{print 100 - ((sum/(rest+sum))*100)}' ${NAME}.${DELTA}.shiftedcov.txt)
-class=$(awk '{if ($1 !~ "{") print $0}' ${NAME}.genus.tab | grep -v "^@" | awk '{print $1"-"$2"-"$3"-"$4"-"$5}' | tr -s '\n' ',' | sed 's/,$/\n/')
+if [ -s ${NAME}.genus.tab ]; then
+    class=$(awk '{if ($1 !~ "{") print $0}' ${NAME}.genus.tab | grep -v "^@" | awk '{print $1"-"$2"-"$3"-"$4"-"$5}' | tr -s '\n' ',' | sed 's/,$/\n/')
+else
+    class="NA"
+fi
 SAMPLE=$(basename $NAME)
 echo $SAMPLE
 WORKDIR=$(dirname "$NAME")
@@ -862,8 +893,8 @@ rm ${NAME}.${WSIZE}.regions.bed.gz.csi
 rm ${NAME}.${WSIZE}.per-base.bed.gz
 rm ${NAME}.${WSIZE}.per-base.bed.gz.csi
 rm ${NAME}.unmapped.fasta
-rm ${NAME}*.tab
-rm ${NAME}.map
+rm -f ${NAME}*.tab      # -f: MetaPhyler may have produced nothing
+rm -f ${NAME}.map
 rm ${WORKDIR}/CV.${SAMPLE}.${WSIZE}.txt
 rm ${WORKDIR}/Gini.${SAMPLE}.${WSIZE}.txt
 rm ${WORKDIR}/Autocorrelation.${SAMPLE}.${DELTA}.txt
