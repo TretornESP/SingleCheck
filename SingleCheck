@@ -203,15 +203,43 @@ fi
 ############################################################################
 #                        LOAD MODULES                                      #
 ############################################################################
-	
-	module purge 2> /dev/null
-	module load samtools/1.10 2> /dev/null
-	module load gcc/6.4.0 R/3.6.3 2> /dev/null
-        module load miniconda3/4.8.2 2> /dev/null
-        module load gcccore/6.4.0 bedtools/2.28.0 2> /dev/null
-        module load gcccore/6.4.0 bwa-mem2/2.0 2> /dev/null
-        module load gcc/6.4.0 bwa/0.7.17 2> /dev/null
-	module load picard/2.18.14 2> /dev/null
+# Every `module load` here is best-effort: a different cluster may name the
+# modules differently, may not use environment modules at all, or may provide
+# the tools through $SINGLECHECK_ENV / conda / $PATH. What is NOT optional is
+# the result -- the CHECK DEPENDENCIES section below refuses to start the
+# pipeline unless every tool is really there and really works.
+
+	MODULES_LOADED=""
+	MODULES_FAILED=""
+	HAVE_MODULE=0
+	type module >/dev/null 2>&1 && HAVE_MODULE=1
+
+	# try_module <spec> [alternative spec ...]
+	# Loads the first spec that works and remembers the outcome, so the
+	# dependency report can tell "this module is not on the cluster" apart
+	# from "this binary is nowhere to be found".
+	try_module() {
+	    local spec
+	    [ "$HAVE_MODULE" -eq 1 ] || return 1
+	    for spec in "$@"; do
+	        if module load $spec 2>/dev/null; then
+	            MODULES_LOADED="${MODULES_LOADED} ${spec}"
+	            return 0
+	        fi
+	    done
+	    MODULES_FAILED="${MODULES_FAILED} $1"
+	    return 1
+	}
+
+	[ "$HAVE_MODULE" -eq 1 ] && module purge 2> /dev/null
+	try_module samtools/1.10 samtools
+	try_module "gcc/6.4.0 R/3.6.3" R
+	try_module miniconda3/4.8.2 miniconda3
+	try_module "gcccore/6.4.0 bedtools/2.28.0" bedtools
+	try_module "gcccore/6.4.0 bwa-mem2/2.0" bwa-mem2
+	try_module "gcc/6.4.0 bwa/0.7.17" bwa
+	# Picard is no longer used (DownsampleSam was replaced by `samtools view -s`,
+	# see HPC_OPTIMIZATION.md item 2), so no picard module is required.
         source activate /mnt/netapp1/posadalab/APPS/CommonCondaEnvironments/mosdepth 2> /dev/null
 
         # Optional per-cluster environment overrides. Point $SINGLECHECK_ENV at a
@@ -278,92 +306,298 @@ METAPHYLER="${METAPHYLER:-$HOME/apps/Metaphyler/MetaPhylerSRV0.115/metaphyler.pl
 ############################################################################
 #                        CHECK DEPENDENCIES                                #
 ############################################################################
-# Fail fast: verify every external tool, conda env, module-provided binary,
-# helper script, folder and file is present BEFORE doing any heavy work.
+# Fail fast: verify that every module, external tool, R package, helper
+# script, reference index, input file and output/scratch directory is present
+# AND actually usable BEFORE doing any heavy work. Nothing below this block
+# is executed unless every check passes.
+#
+# A tool counts as available when it is on $PATH *or* when its absolute path
+# was exported (MOSDEPTH, BEDTOOLS, METAPHYLER) -- and when it really runs,
+# which is what catches a module that loaded but is broken.
+#
+# Set SINGLECHECK_STRICT_MODULES=1 to also abort when a `module load` failed,
+# even if the tool it provides was found elsewhere on $PATH.
 
 echo "> Checking dependencies"
 missing=0
+warnings=0
 
-# A module-provided tool is only considered loaded if its binary is on $PATH
-# (module load runs best-effort with 2>/dev/null, so this is the real check).
-check_cmd() {
-    if ! command -v "$1" >/dev/null 2>&1; then
-        printf "  [MISSING] command '%s' not found on PATH%s\n" "$1" "${2:+ -- $2}" >&2
-        missing=1
+err()   { printf "  [MISSING] %s\n" "$1" >&2; missing=$((missing+1)); }
+warn()  { printf "  [WARN]    %s\n" "$1" >&2; warnings=$((warnings+1)); }
+found() { printf "  [ok]      %s\n" "$1"; }
+
+# have <handle>: a command on $PATH, or an executable given as a path
+have()    { command -v "$1" >/dev/null 2>&1 || [ -x "$1" ]; }
+resolve() { command -v "$1" 2>/dev/null || printf '%s\n' "$1"; }
+
+# version_ge <found> <minimum> -- compare dotted numeric versions
+version_ge() {
+    awk -v a="$1" -v b="$2" 'BEGIN{
+        na=split(a,A,"."); nb=split(b,B,"."); n=(na>nb?na:nb)
+        for(i=1;i<=n;i++){ x=A[i]+0; y=B[i]+0; if(x>y) exit 0; if(x<y) exit 1 }
+        exit 0}'
+}
+
+# require_tool <handle> <pretty name> <min version|-> <hint> <version command...>
+# Checks that the tool is present, that it actually runs (a module that loaded
+# but cannot find its libraries fails here) and that it is new enough.
+require_tool() {
+    local handle="$1" pretty="$2" minv="$3" hint="$4"; shift 4
+    local path out ver
+    if ! have "$handle"; then
+        err "$pretty not found (looked for '$handle')${hint:+ -- $hint}"
+        return 1
+    fi
+    path="$(resolve "$handle")"
+    if ! out="$("$@" 2>&1)"; then
+        err "$pretty found at $path but does not run${hint:+ -- $hint}"
+        printf "%s\n" "$out" | head -n 3 | sed 's/^/            /' >&2
+        return 1
+    fi
+    if [ "$minv" = "-" ]; then
+        found "$pretty ($path)"
+        return 0
+    fi
+    ver=$(printf "%s\n" "$out" | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1)
+    if [ -z "$ver" ]; then
+        warn "could not determine the version of $pretty at $path (need >= $minv)"
+        found "$pretty (unknown version, $path)"
+    elif version_ge "$ver" "$minv"; then
+        found "$pretty $ver ($path)"
+    else
+        err "$pretty $ver at $path is too old, need >= $minv${hint:+ -- $hint}"
     fi
 }
 
-# Like check_cmd but also accepts an absolute path (for tools given via
-# $MOSDEPTH/$BEDTOOLS rather than a module).
-check_tool() {
-    if ! command -v "$1" >/dev/null 2>&1 && [ ! -x "$1" ]; then
-        printf "  [MISSING] tool '%s' not found on PATH or as an executable%s\n" "$1" "${2:+ -- $2}" >&2
-        missing=1
+# --- environment modules -----------------------------------------------------
+if [ "$HAVE_MODULE" -eq 1 ]; then
+    [ -n "$MODULES_LOADED" ] && found "modules loaded:$MODULES_LOADED"
+    if [ -n "$MODULES_FAILED" ]; then
+        if [ -n "${SINGLECHECK_STRICT_MODULES:-}" ]; then
+            err "module(s) not available on this cluster:$MODULES_FAILED (SINGLECHECK_STRICT_MODULES=1)"
+        else
+            warn "module(s) not available on this cluster:$MODULES_FAILED -- only a problem if a tool below is missing"
+        fi
     fi
-}
-
-# Core tools (provided by SLURM modules / conda env / $SINGLECHECK_ENV)
-check_cmd  samtools  "module load samtools"
-check_tool "$BEDTOOLS" "module load bedtools, or set BEDTOOLS=/path/to/bedtools"
-check_tool "$MOSDEPTH" "set MOSDEPTH=/path/to/mosdepth in \$SINGLECHECK_ENV"
-check_cmd  Rscript   "module load R"
-check_cmd bc
-check_cmd awk
-check_cmd sort
-check_cmd zcat
-check_cmd gzip
-
-# Aligner is only needed when the input is FASTQ
-if [ "$METHOD" == "Paired-end" ] || [ "$METHOD" == "Single-end" ]; then
-    if ! command -v bwa-mem2 >/dev/null 2>&1 && ! command -v bwa >/dev/null 2>&1; then
-        printf "  [MISSING] no aligner on PATH (need bwa-mem2 or bwa)\n" >&2
-        missing=1
-    fi
+else
+    warn "no 'module' command available -- every tool must be on \$PATH or set in \$SINGLECHECK_ENV"
 fi
 
-# R packages required by the metric scripts must be loadable
-if command -v Rscript >/dev/null 2>&1; then
-    if ! Rscript -e 'ok <- all(sapply(c("tidyr","dplyr","matrixStats"), requireNamespace, quietly=TRUE)); quit(status=if(ok) 0 else 1)' >/dev/null 2>&1; then
-        printf "  [MISSING] R packages not all installed (need tidyr, dplyr, matrixStats)\n" >&2
-        missing=1
-    fi
-fi
-
-# Helper R scripts shipped with the pipeline
-for rs in GiniIndex.R CoefficientOfVariation.R Autocorrelation.R MAD.R; do
-    if [ ! -f "${SCRIPTDIR}/src/${rs}" ]; then
-        printf "  [MISSING] helper script ${SCRIPTDIR}/src/${rs}\n" >&2
-        missing=1
-    fi
+# --- shell / coreutils helpers the pipeline pipes data through ---------------
+core_missing=""
+for c in grep sed awk sort uniq cut head tail paste tr wc zcat gzip ln readlink basename dirname df; do
+    have "$c" || core_missing="$core_missing $c"
 done
+if [ -n "$core_missing" ]; then
+    err "basic shell utilities not found on \$PATH:$core_missing"
+else
+    found "shell utilities (grep sed awk sort uniq cut head tail paste tr wc zcat gzip)"
+fi
 
-# Metaphyler (contamination detection)
+# GNU sort is required: the autocorrelation step uses --parallel,
+# --compress-program and --version-sort, which BSD/busybox sort do not have.
+if have sort; then
+    if printf '' | sort --parallel=2 --compress-program="$SORTCOMP" -T "$SCRATCH" --version-sort >/dev/null 2>&1; then
+        found "GNU sort (--parallel, --compress-program=$SORTCOMP, --version-sort)"
+    else
+        err "'sort' at $(resolve sort) does not support --parallel / --compress-program=$SORTCOMP / --version-sort (GNU coreutils sort required)"
+    fi
+fi
+
+# bc must be present AND able to do floating point (downsampling probability)
+if ! have bc; then
+    err "command 'bc' not found on \$PATH (needed for the downsampling probability)"
+elif [ -z "$(printf 'scale=10; 1/3\n' | bc -l 2>/dev/null)" ]; then
+    err "'bc' at $(resolve bc) is present but produced no output for a test computation"
+else
+    found "bc ($(resolve bc))"
+fi
+
+# --- the tools that do the actual work ---------------------------------------
+require_tool samtools "samtools" 1.9 \
+    "module load samtools/1.10" \
+    samtools --version
+require_tool "$BEDTOOLS" "bedtools" 2.25 \
+    "module load bedtools, or set BEDTOOLS=/path/to/bedtools in \$SINGLECHECK_ENV" \
+    "$BEDTOOLS" --version
+require_tool "$MOSDEPTH" "mosdepth" 0.2.5 \
+    "activate the mosdepth conda env, or set MOSDEPTH=/path/to/mosdepth in \$SINGLECHECK_ENV" \
+    "$MOSDEPTH" --version
+require_tool Rscript "R (Rscript)" 3.5 \
+    "module load R" \
+    Rscript --version
+
+# Optional accelerators: the pipeline falls back to plain gzip/gzip-compressed
+# sort spill, it just runs slower.
+have pigz  || have bgzip || warn "neither pigz nor bgzip found -- the per-base track will be compressed with single-threaded gzip"
+have zstd  || warn "zstd not found -- sort spill files will be compressed with $SORTCOMP"
+
+# --- R packages used by the four metric scripts ------------------------------
+if have Rscript; then
+    rmissing=$(Rscript -e 'p <- c("tidyr","dplyr","matrixStats"); m <- p[!sapply(p, requireNamespace, quietly=TRUE)]; cat(paste(m, collapse=" "))' 2>/dev/null)
+    rrc=$?
+    if [ "$rrc" -ne 0 ]; then
+        err "could not query the R library (Rscript exited $rrc) -- check the R module/installation"
+    elif [ -n "$rmissing" ]; then
+        err "R package(s) not installed: $rmissing -- install.packages(c(\"tidyr\",\"dplyr\",\"matrixStats\"))"
+    else
+        found "R packages tidyr, dplyr, matrixStats"
+    fi
+fi
+
+# --- helper scripts shipped with the pipeline --------------------------------
+if [ ! -d "${SCRIPTDIR}/src" ]; then
+    err "helper directory ${SCRIPTDIR}/src not found -- SingleCheck must keep its src/ folder next to it (resolved SCRIPTDIR=${SCRIPTDIR})"
+else
+    rs_missing=""
+    for rs in GiniIndex.R CoefficientOfVariation.R Autocorrelation.R MAD.R; do
+        [ -r "${SCRIPTDIR}/src/${rs}" ] || rs_missing="$rs_missing $rs"
+    done
+    if [ -n "$rs_missing" ]; then
+        err "helper script(s) missing or unreadable in ${SCRIPTDIR}/src:$rs_missing"
+    else
+        found "helper R scripts (${SCRIPTDIR}/src)"
+    fi
+fi
+
+# --- Metaphyler (contamination detection) ------------------------------------
 if [ ! -f "$METAPHYLER" ]; then
-    printf "  [MISSING] Metaphyler not found at %s (set \$METAPHYLER to override)\n" "$METAPHYLER" >&2
-    missing=1
+    err "Metaphyler not found at $METAPHYLER (set \$METAPHYLER to the full path of metaphyler.pl)"
+elif [ ! -x "$METAPHYLER" ]; then
+    err "Metaphyler at $METAPHYLER is not executable (chmod +x it)"
+else
+    if ! have perl; then
+        err "perl not found on \$PATH (needed to run $METAPHYLER)"
+    fi
+    if ! have blastall && ! have blastn; then
+        warn "neither blastall nor blastn on \$PATH -- Metaphyler classification is likely to fail"
+    fi
+    found "Metaphyler ($METAPHYLER)"
 fi
 
-# Reference and its indexes (required for FASTQ alignment and CRAM input)
+# --- aligner + its reference index (FASTQ input only) ------------------------
+ALIGNER=""
+if [ "$METHOD" == "Paired-end" ] || [ "$METHOD" == "Single-end" ]; then
+    if [ -z "$REFERENCE" ]; then
+        err "FASTQ input requires a reference genome (-r ref.fa)"
+    fi
+    # Prefer bwa-mem2 (~1.3-1.8x faster) when its index is present; else classic bwa.
+    if command -v bwa-mem2 >/dev/null 2>&1 && [ -n "$REFERENCE" ] && [ -f "${REFERENCE}.bwt.2bit.64" ]; then
+        ALIGNER="bwa-mem2 mem"
+        idx_missing=""
+        for ext in 0123 amb ann bwt.2bit.64 pac; do
+            [ -f "${REFERENCE}.${ext}" ] || idx_missing="$idx_missing ${REFERENCE}.${ext}"
+        done
+        if [ -n "$idx_missing" ]; then
+            err "incomplete bwa-mem2 index (missing:$idx_missing) -- run: bwa-mem2 index $REFERENCE"
+        else
+            found "aligner bwa-mem2 ($(resolve bwa-mem2)) + its index"
+        fi
+    elif command -v bwa >/dev/null 2>&1; then
+        ALIGNER="bwa mem"
+        if [ -n "$REFERENCE" ]; then
+            idx_missing=""
+            for ext in amb ann bwt pac sa; do
+                [ -f "${REFERENCE}.${ext}" ] || idx_missing="$idx_missing ${REFERENCE}.${ext}"
+            done
+            if [ -n "$idx_missing" ]; then
+                err "incomplete bwa index (missing:$idx_missing) -- run: bwa index $REFERENCE"
+            else
+                found "aligner bwa ($(resolve bwa)) + its index"
+            fi
+        fi
+    else
+        err "no aligner on \$PATH (need bwa-mem2 or bwa) -- module load bwa-mem2 / bwa"
+    fi
+fi
+
+# --- reference genome --------------------------------------------------------
 if [ -n "$REFERENCE" ]; then
-    [ -f "$REFERENCE" ]        || { printf "  [MISSING] reference fasta %s\n" "$REFERENCE" >&2; missing=1; }
-    [ -f "${REFERENCE}.fai" ]  || { printf "  [MISSING] samtools faidx index %s.fai\n" "$REFERENCE" >&2; missing=1; }
+    if [ ! -f "$REFERENCE" ]; then
+        err "reference fasta not found: $REFERENCE"
+    elif [ ! -r "$REFERENCE" ]; then
+        err "reference fasta not readable: $REFERENCE"
+    else
+        if [ ! -f "${REFERENCE}.fai" ]; then
+            err "samtools faidx index missing: ${REFERENCE}.fai -- run: samtools faidx $REFERENCE"
+        else
+            found "reference $REFERENCE (+ .fai)"
+        fi
+    fi
 fi
 
-# Pre-aligned input file and its index
+# --- input file(s) and index -------------------------------------------------
 if [ "$METHOD" == "Aligned" ]; then
-    [ -f "$ALN" ]    || { printf "  [MISSING] input file %s\n" "$ALN" >&2; missing=1; }
-    [ -f "$ALNIDX" ] || { printf "  [MISSING] index %s (run samtools index)\n" "$ALNIDX" >&2; missing=1; }
+    if [ ! -r "$ALN" ]; then
+        err "input file not readable: $ALN"
+    elif [ ! -s "$ALN" ]; then
+        err "input file is empty: $ALN"
+    else
+        if have samtools && ! samtools quickcheck "$ALN" >/dev/null 2>&1; then
+            if [[ "$ALN" == *.cram ]]; then
+                warn "samtools quickcheck is unhappy about $ALN -- check the file and its reference"
+            else
+                err "$ALN is not a valid/complete BAM (samtools quickcheck failed: truncated or not a BAM?)"
+            fi
+        fi
+        if [ ! -f "$ALNIDX" ]; then
+            err "index missing: $ALNIDX -- run: samtools index $ALN"
+        else
+            [ "$ALNIDX" -ot "$ALN" ] && warn "index $ALNIDX is older than $ALN -- consider re-running samtools index"
+            found "input $ALN (+ $(basename "$ALNIDX"))"
+        fi
+    fi
+else
+    for fq in "$FASTQ1" "$FASTQ2"; do
+        [ -n "$fq" ] || continue
+        if [ ! -r "$fq" ]; then
+            err "FASTQ not readable: $fq"
+        elif [ ! -s "$fq" ]; then
+            err "FASTQ is empty: $fq"
+        else
+            found "input $fq"
+        fi
+    done
 fi
 
-# Working directory and node-local scratch must be writable
+# --- directories the pipeline writes to --------------------------------------
 WORKDIR_CHECK=$(dirname "$NAME")
-[ -d "$WORKDIR_CHECK" ] && [ -w "$WORKDIR_CHECK" ] || { printf "  [MISSING] output dir %s not writable\n" "$WORKDIR_CHECK" >&2; missing=1; }
-[ -d "$SCRATCH" ] && [ -w "$SCRATCH" ]             || { printf "  [MISSING] scratch dir %s not writable\n" "$SCRATCH" >&2; missing=1; }
+if [ -d "$WORKDIR_CHECK" ] && [ -w "$WORKDIR_CHECK" ]; then
+    found "output directory $WORKDIR_CHECK is writable"
+else
+    err "output directory $WORKDIR_CHECK does not exist or is not writable"
+fi
+if [ -d "$SCRATCH" ] && [ -w "$SCRATCH" ]; then
+    found "scratch directory $SCRATCH is writable"
+else
+    err "scratch directory $SCRATCH does not exist or is not writable (set \$TMPDIR)"
+fi
 
+# Not fatal, but a full scratch is the classic way this pipeline dies halfway:
+# the whole-genome sort in the autocorrelation step spills there.
+if have df; then
+    free_kb=$(df -Pk "$SCRATCH" 2>/dev/null | awk 'NR==2{print $4}')
+    case "$free_kb" in
+        ''|*[!0-9]*) : ;;
+        *) [ "$free_kb" -lt 5000000 ] && warn "only $((free_kb/1024)) MB free in $SCRATCH -- the sort step may run out of space" ;;
+    esac
+fi
+
+# Threads must exist: asking for more than the allocation slows everything down.
+ncpus="${SLURM_CPUS_PER_TASK:-$(nproc 2>/dev/null || echo 0)}"
+case "$ncpus" in
+    ''|*[!0-9]*) ncpus=0 ;;
+esac
+if [ "$ncpus" -gt 0 ] && [ "$THREADS" -gt "$ncpus" ]; then
+    warn "-t $THREADS is larger than the $ncpus CPU(s) available to this job"
+fi
+
+# --- verdict -----------------------------------------------------------------
 if [ "$missing" -ne 0 ]; then
-    printf "\nError: one or more dependencies are missing (see above). Aborting before running.\n" >&2
+    printf "\nError: %d dependency problem(s) found (see the [MISSING] lines above).\nAborting before doing any work.\n" "$missing" >&2
     exit 1
 fi
+[ "$warnings" -ne 0 ] && printf "  %d warning(s) -- continuing\n" "$warnings"
 echo "  all dependencies OK"
 
 # ///////// CONDA ENVIRONMENTS MISSING, CREATE A SINGLE ONE
@@ -373,19 +607,9 @@ echo "  all dependencies OK"
 ############################################################################
 
 if [ "$METHOD" == "Paired-end" ] || [ "$METHOD" == "Single-end" ]; then
-        fai_index=$(echo $REFERENCE | sed 's/.fa/.fai/')
-        bwa_index=$(echo $REFERENCE | sed 's/.fa/.fa.ann/')
-        if [ -z $REFERENCE ] || [ ! -f $REFERENCE ] || [ ! -f $fai_index ] || [ ! -f $bwa_index ];then
-             printf "\nCheck that your reference exists and it has been properly indexed!\n" >&2
-             exit 1
-        fi
-
-	# Prefer bwa-mem2 (~1.3-1.8x faster) when its index is present; else classic bwa.
-	if command -v bwa-mem2 >/dev/null 2>&1 && [ -f "${REFERENCE}.bwt.2bit.64" ]; then
-		ALIGNER="bwa-mem2 mem"
-	else
-		ALIGNER="bwa mem"
-	fi
+	# The reference, its .fai and the aligner index were all verified in
+	# CHECK DEPENDENCIES, which also picked $ALIGNER (bwa-mem2 when its index
+	# is present -- ~1.3-1.8x faster -- otherwise classic bwa).
 	$ALIGNER \
 		-t $THREADS $REFERENCE \
 		$FASTQ1 $FASTQ2 | \
@@ -487,7 +711,8 @@ echo "> Running mosdepth"
         # Output .regions.bed.gz contains mean base depth per window
 	rm ${NAME}.${WSIZE}.mosdepth* # remove extra files created by mosdepth
 
-conda deactivate
+# Only meaningful when mosdepth came from the conda env activated above.
+command -v conda >/dev/null 2>&1 && conda deactivate
 
 echo "> Creating input for autocorrelation"
         zcat ${NAME}.${WSIZE}.per-base.bed.gz | \

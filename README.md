@@ -7,12 +7,15 @@
 
 ### Dependencies
 
-* [BWA-MEM](https://github.com/lh3/bwa)
-* [PICARD](https://broadinstitute.github.io/picard/)
-* [mosdepth](https://github.com/brentp/mosdepth)
-* [bedtools](https://bedtools.readthedocs.io/en/latest/)
-* [samtools](http://www.htslib.org/)
-* R packages for the main program:
+* [samtools](http://www.htslib.org/) &#8805; 1.9
+* [mosdepth](https://github.com/brentp/mosdepth) &#8805; 0.2.5
+* [bedtools](https://bedtools.readthedocs.io/en/latest/) &#8805; 2.25
+* [BWA-MEM](https://github.com/lh3/bwa) or [bwa-mem2](https://github.com/bwa-mem2/bwa-mem2) (only for FASTQ input)
+* [MetaPhyler](http://metaphyler.cbcb.umd.edu/) plus `perl` and `blastn`/`blastall`
+  (set `$METAPHYLER` to the full path of its `metaphyler.pl`)
+* GNU coreutils (`sort` with `--parallel` / `--compress-program` / `--version-sort`) and `bc`
+* optional, for speed: `pigz` or `bgzip`, and `zstd`
+* R &#8805; 3.5 with the packages for the main program:
 	* tidyr
 	* dplyr
 	* matrixStats
@@ -24,6 +27,15 @@
   * data.table
   * ggplot2
   * plotly
+
+`SingleCheck` checks all of this before it starts: every module, tool, R package, helper
+script, reference index, input file and output/scratch directory is verified — and every
+external tool is actually executed once, so a module that loaded but is broken is caught
+too. If anything is missing the run aborts with a `[MISSING]` list and does no work.
+On a cluster whose modules are named differently, point `$SINGLECHECK_ENV` at a file that
+loads them (see `singlecheck_env.sh`) or export `MOSDEPTH`, `BEDTOOLS` and `METAPHYLER`
+with absolute paths. Set `SINGLECHECK_STRICT_MODULES=1` to also abort when a `module load`
+fails, even if the tool it provides was found elsewhere on `$PATH`.
 
 
 ## Usage
