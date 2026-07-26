@@ -8,8 +8,11 @@
 # Usage:
 #   export SINGLECHECK_ENV=/mnt/lustre/scratch/nlsas/home/ulc/cursos/curso385/singlecheck_env.sh
 #   ./SingleCheck sample.bam
-# or with the benchmark:
-#   ./benchmark_singlecheck.sh --env "$SINGLECHECK_ENV" -i sample.bam -g 'SingleCheck*' -- -t 8
+# or with the benchmarks (they have no --env option: they inherit the exported
+# variable, and every SingleCheck they launch sources it):
+#   export SINGLECHECK_ENV=$PWD/singlecheck_env.sh
+#   ./benchmark_singlecheck.sh -i sample.bam -g 'SingleCheck*' -- -t 8
+#   ./bench/bench_stages.sh -i sample.bam -r 5 --threads 32
 
 # --- modules available on this cluster (CESGA / FinisTerrae) -----------------
 module load bedtools/2.31.0 2> /dev/null

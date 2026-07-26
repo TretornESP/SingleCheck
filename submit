@@ -95,6 +95,8 @@ case "$BASENAME" in
   SingleCheck)                    D_CPUS=8; D_TIME=10:00:00; D_MEM=64G  ;;
   SingleCheckArray)               D_CPUS=3; D_TIME=10:00:00; D_MEM=60G  ;;
   bench_stages.sh)                D_CPUS=8; D_TIME=12:00:00; D_MEM=64G  ;;
+  # runs the WHOLE pipeline (versions x reps) times, so give it real time
+  benchmark_singlecheck.sh)       D_CPUS=8; D_TIME=24:00:00; D_MEM=64G  ;;
   DownsampleSam.sh)               D_CPUS=1; D_TIME=10:00:00; D_MEM=100G ;;
   SortSam.sh)                     D_CPUS=1; D_TIME=12:00:00; D_MEM=40G  ;;
   SimulateSingleCellReads.sh)     D_CPUS=1; D_TIME=20:00:00; D_MEM=20G  ;;
