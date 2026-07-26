@@ -185,7 +185,11 @@ stage_mosdepth() {
         --mapq $MAPQUAL \
         ${NAME}.${WSIZE} \
         ${NAME}.${downsampling_depth}X.bam
+    # keep mosdepth's status: the `rm` below always succeeds and would otherwise
+    # report a failed chunk as OK
+    rc=$?
     rm -f ${NAME}.${WSIZE}.mosdepth*
+    return $rc
 }
 
 # --- autocorrelation input ---------------------------------------------------
@@ -903,6 +907,7 @@ STATE_VARS=(FILE FASTQ1 FASTQ2 METHOD NAME ALN ALNIDX SAMREF REFERENCE THREADS
             WSIZE DELTA FLAGTOFILTEROUT MAPQUAL DIPLOID_REGEX MT_REGEX
             downsampling_depth ds_strategy DOWNSAMPLE SCRATCH SORTCOMP GZIP_CMD
             MOSDEPTH BEDTOOLS METAPHYLER SRCDIR WORK BENCH_VALS ALIGNER
+            MD_THREADS SORTMEM
             genome_length raw_reads mean_readlength raw_bases sequencing_depth
             probability DEPTH DS_MODE)
 
@@ -1052,10 +1057,25 @@ run_one() {
     cpu=$(awk -F': ' '/Percent of CPU/{gsub("%","",$2); print $2}' "$tf"); cpu="${cpu:-NA}"
     rss=$(awk '/Maximum resident set size/{print $NF}' "$tf"); rss="${rss:-NA}"
   fi
+  # A chunk that exits 0 but produced none of the artifacts it declares is a
+  # silent failure (a trailing `rm`/`cp` masking the real status, a tool that
+  # printed usage and quit, ...). Do not report a time for it.
+  local note="-"
+  if [ "$rc" -eq 0 ] && [ -n "${S_RESET[$key]}" ]; then
+    local produced=0
+    for f in ${S_RESET[$key]}; do [ -e "$f" ] && produced=1 && break; done
+    if [ "$produced" -eq 0 ]; then
+      rc=127
+      note="exited 0 but produced none of its outputs -- see logs/${key}.rep${rep}.log"
+      echo "      !! $key produced no output despite exit 0 -- see $lf" >&2
+    fi
+  fi
+
   local status="OK"; [ "$rc" -ne 0 ] && status="FAILED"
   [ "$rep" = "warmup" ] && status="WARMUP"
+  R_RC=$rc
   printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-    "$key" "${S_GROUP[$key]}" "$rep" "$status" "$R_WALL" "$user" "$sys" "$cpu" "$rss" "$rc" "-" >> "$TIMINGS"
+    "$key" "${S_GROUP[$key]}" "$rep" "$status" "$R_WALL" "$user" "$sys" "$cpu" "$rss" "$rc" "$note" >> "$TIMINGS"
 }
 
 skip_stage() { # key reason

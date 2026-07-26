@@ -942,7 +942,19 @@ echo "> Running mosdepth"
                 ${WORKPFX}.${WSIZE} \
                 ${WORKPFX}.${downsampling_depth}X.bam
         # Output .regions.bed.gz contains mean base depth per window
-	rm ${WORKPFX}.${WSIZE}.mosdepth* # remove extra files created by mosdepth
+	md_rc=$?
+	rm -f ${WORKPFX}.${WSIZE}.mosdepth* # remove extra files created by mosdepth
+
+	# Fail loudly here rather than three steps later with "no such file":
+	# everything downstream reads these two tracks.
+	if [ "$md_rc" -ne 0 ] || [ ! -s ${WORKPFX}.${WSIZE}.per-base.bed.gz ] \
+	                      || [ ! -s ${WORKPFX}.${WSIZE}.regions.bed.gz ]; then
+	    printf "\nError: mosdepth (exit %s) did not produce %s.per-base.bed.gz / .regions.bed.gz\n" \
+	           "$md_rc" "${WORKPFX}.${WSIZE}" >&2
+	    printf "       Command was: %s -t %s --fast-mode --by %s --flag %s --mapq %s\n" \
+	           "$MOSDEPTH" "$MD_THREADS" "$WSIZE" "$FLAGTOFILTEROUT" "$MAPQUAL" >&2
+	    exit 1
+	fi
 
 # Only meaningful when mosdepth came from the conda env activated above.
 command -v conda >/dev/null 2>&1 && conda deactivate
