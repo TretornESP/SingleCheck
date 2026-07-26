@@ -7,9 +7,15 @@
 # runs it ONCE, with the settings that matter at 300 GB, after checking
 # everything that could waste those hours.
 #
+# The run benchmarks itself: SingleCheck times every phase and writes a
+# .SingleCheck.timings.tsv next to the result, which costs nothing. --stages
+# additionally submits the per-chunk profiler as a second job (~one more
+# pipeline run at this size).
+#
 # Usage:
 #   ./runnerhuge.sh [/path/to/Wang300.bam]      # submit
-#   ./runnerhuge.sh --dry-run                   # show the sbatch line only
+#   ./runnerhuge.sh --stages                    # + per-chunk profile job
+#   ./runnerhuge.sh --dry-run                   # show the sbatch lines only
 ###############################################################################
 set -uo pipefail
 
@@ -24,9 +30,11 @@ TIME=48:00:00          # lower it if your QoS rejects it (sbatch will say so)
 
 DRYRUN=""
 BAM=""
+DO_STAGES=0            # --stages: also submit the per-chunk profiler
 for a in "$@"; do
     case "$a" in
         --dry-run) DRYRUN="--dry-run" ;;
+        --stages)  DO_STAGES=1 ;;
         -h|--help) sed -n '2,/^###########/p' "$0" | sed 's/^# \{0,1\}//;s/^#//'; exit 0 ;;
         *)         BAM="$a" ;;
     esac
@@ -100,8 +108,18 @@ echo "[ok]   quickcheck passed"
 read unmapped_reads fasta_gb < <(samtools idxstats "$BAM" 2>/dev/null | \
     awk '{u+=$4} END{printf "%d %.1f\n", u, u*250/1024/1024/1024}')
 echo "[info] unmapped reads: ${unmapped_reads:-?}  (~${fasta_gb:-?} GB of FASTA if MetaPhyler ran)"
-export SINGLECHECK_SKIP_METAPHYLER=1
-echo "[ok]   MetaPhyler branch disabled -> one less full pass over the input"
+
+# ---------------------------------------------------------------------------
+# 3b. The optimal flag set for a huge input. Together these take the pipeline
+#     from THREE full passes over the input to ONE (only the downsampling).
+#     Each is individually reversible; see OPTIMIZATION_REPORT.md.
+# ---------------------------------------------------------------------------
+export SINGLECHECK_SKIP_METAPHYLER=1   # no unmapped scan at all (column = NA)
+export SINGLECHECK_INDEX_DEPTH=1       # read count from the index, not a full pass
+export SINGLECHECK_FAST_UNMAPPED=1     # if MetaPhyler is ever re-enabled: '*' block only
+echo "[ok]   MetaPhyler branch disabled     -> one less full pass"
+echo "[ok]   depth from the index           -> one less full pass (ESTIMATE, see below)"
+echo "[ok]   uncompressed transient BAM + piped shifted track (automatic)"
 
 # ---------------------------------------------------------------------------
 # 4. I/O environment: striping on the input, and node-local scratch capacity.
@@ -134,11 +152,35 @@ echo "--------------------------------------------------------------"
 echo " cpus=$CPUS  mem=$MEM  time=$TIME"
 echo "--------------------------------------------------------------"
 
+EXPORTS="ALL,SINGLECHECK_ENV=$SINGLECHECK_ENV,MOSDEPTH=$MOSDEPTH,SINGLECHECK_SKIP_METAPHYLER=1,SINGLECHECK_INDEX_DEPTH=1,SINGLECHECK_FAST_UNMAPPED=1"
+
+# The run measures itself: SingleCheck times every phase and writes
+# <sample>.SingleCheck.timings.tsv next to the result. At this size that is the
+# only affordable benchmark -- bench/bench_stages.sh re-runs each chunk, which
+# means paying for the full-file passes several times over.
 ./submit $DRYRUN \
     --cpus "$CPUS" --mem "$MEM" --time "$TIME" \
     --name sc_huge \
-    --sbatch "--export=ALL,SINGLECHECK_ENV=$SINGLECHECK_ENV,SINGLECHECK_SKIP_METAPHYLER=1,MOSDEPTH=$MOSDEPTH" \
+    --sbatch "--export=$EXPORTS" \
     SingleCheck "$BAM"
+
+# --stages: per-chunk detail as a SEPARATE job. One repetition only, no legacy
+# variants, intermediates on node-local scratch: roughly the cost of one more
+# pipeline run. Do not raise -r here without doing the arithmetic first.
+if [ "$DO_STAGES" -eq 1 ]; then
+    echo
+    echo ">>> per-chunk profile (separate job, -r 1, no legacy variants)"
+    ./submit $DRYRUN \
+        --cpus "$CPUS" --mem "$MEM" --time "$TIME" \
+        --name sc_huge_stages \
+        --sbatch "--export=$EXPORTS" \
+        bench/bench_stages.sh \
+        -i "$BAM" \
+        -r 1 \
+        --threads "$CPUS" \
+        --no-compare \
+        --work-scratch
+fi
 
 [ -n "$DRYRUN" ] && exit 0
 
@@ -146,14 +188,33 @@ cat <<EOF
 
 Submitted. In sc_huge-<jobid>.out check the "> HPC settings" block first:
 
-  intermediates      : /scratch/<jobid>/...      <- must NOT say "shared filesystem"
+  intermediates      : /scratch/<jobid>/...    <- must NOT say "shared filesystem"
   MetaPhyler branch  : SKIPPED
+  sequencing depth   : from the index (no counting pass; ESTIMATE)
+  autocorrelation    : sort-free aggregation, shifted track piped (no temp file)
+  downsampled BAM    : uncompressed (transient)
   threads            : $CPUS (samtools/sort/aligner), $CPUS (mosdepth)
-  autocorrelation    : sort-free streaming aggregation
+
+The run benchmarks itself. At the end of the log:
+
+  > Timing summary (wall clock)
+    PHASE                             SECONDS    SHARE
+    downsample                          ...      ...%
+    mosdepth                            ...      ...%
+    ...
 
 Then:
   squeue -u \$USER
   sacct -j <jobid> --format=JobID,Elapsed,MaxRSS,State   # MaxRSS sizes the next --mem
 
-Result: ${BAM%.bam}.SingleCheck.txt   (13 tab-separated columns, contaminants = NA)
+Results:
+  ${BAM%.bam}.SingleCheck.txt            13 tab-separated columns (contaminants = NA)
+  ${BAM%.bam}.SingleCheck.timings.tsv    per-phase wall clock, machine readable
+$([ "$DO_STAGES" -eq 1 ] && echo "  bench/stages_<host>_<ts>/report.md     per-chunk profile (second job)")
+
+NOTE on SINGLECHECK_INDEX_DEPTH=1: columns 2-3 ("Sequenced bases", "Analysis
+depth") become an estimate -- the index gives every alignment record, and the
+secondary/supplementary share is measured on the first million reads. Drop that
+one variable if you need those two columns exact; it costs one full pass.
+bench/bench_stages.sh reports the exact-vs-estimate error on your own data.
 EOF

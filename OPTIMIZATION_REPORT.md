@@ -26,8 +26,20 @@ Target: a SLURM cluster (CESGA / FinisTerrae), single BAM/CRAM inputs of 300 GB�
 Plus two robustness items from §11 of the analysis: `samtools sort -m` sized from the
 allocation, and thread count taken from `$SLURM_CPUS_PER_TASK`.
 
-**Full-file passes over the original BAM: 3 serial → 2, one of them overlapped.**
-**Whole-genome external sort: removed. Full-file rewrites: 2 → 0.**
+### Round 3 (after the first measurements came in)
+
+| Change | Why | Switch |
+|---|---|---|
+| Read count from the **index** instead of a counting pass | removed a whole pass over the input | `SINGLECHECK_INDEX_DEPTH=1` (estimate) |
+| Unmapped reads via the **`'*'` region** instead of a full scan | index seek instead of a full pass | `SINGLECHECK_FAST_UNMAPPED=1` (subset) |
+| MetaPhyler branch **skippable** | it is a full pass feeding one column that is `NA` while the marker DB is missing | `SINGLECHECK_SKIP_METAPHYLER=1` |
+| Shifted per-base track **piped** into bedtools | removes a genome-sized gzip write + read | automatic, capability-probed |
+| Transient downsampled BAM **uncompressed** | it is deleted at the end; gzip on it is pure waste | `SINGLECHECK_COMPRESS_DS=1` to revert |
+| `mean_readlen` without the external sort, with `-@` | it sorted a million lines to compute a mean | none needed (identical) |
+| mosdepth thread cap **removed** | measured 57.0 s at `-t 32` vs 61.2 s at `-t 4` — the doc's "~4 threads" claim does not hold on this data | `SINGLECHECK_MOSDEPTH_THREADS=N` |
+
+**Full-file passes over the original BAM: 3 → 1** (`downsample` only, with the default flags
+of `runnerhuge.sh`). **Whole-genome external sort: removed. Full-file rewrites: 2 → 0.**
 
 ---
 
@@ -142,11 +154,41 @@ ignored with a warning. Everything downstream is unchanged.
 
 ---
 
+## 1.7 Measured results
+
+End-to-end A/B in one job (`runner.sh`, Wang5.bam, 32 cores, 3 reps), round 2 only —
+the baseline `35ec840` already contains round 1:
+
+| | WALL_min | WALL_mean | verdict |
+|---|---|---|---|
+| `SingleCheckBaseline` | 178.925 s | 179.345 s | baseline |
+| `SingleCheck` | **167.470 s** | 168.115 s | **1.07×**, `CONSISTENT` at 1e-6 |
+
+Per-chunk A/B on the same data (`bench/bench_stages.sh`), the two rewrites in isolation:
+
+| | 1 core | 32 cores |
+|---|---|---|
+| `unionbedg_sort` → `unionbedg_hash` | 104.3 → 81.07 s (−22 %) | 93.77 → 74.33 s (−21 %) |
+| `primary_bam_legacy`+`idxstats_legacy` → `mapstats` | 34.42 → 12.92 s (−63 %) | 9.56 → 3.96 s (−59 %) |
+
+Both equivalence checks reported **identical** output on real data.
+
+Two lessons that changed the plan:
+
+1. **Per-chunk means are not additive to wall-clock.** Sum of chunks was 256 s (optimized) and
+   297 s (baseline) against actual runs of 168 s and 179 s: each benchmarked chunk pays its own
+   cold start, while the real pipeline keeps data warm between adjacent steps. Chunk numbers are
+   for *ratios*, never for predicting totals.
+2. **The profile depends on the input size, and inverts.** At Wang5 scale the autocorrelation
+   chain is ~50 % of wall-clock; but it runs on the *downsampled* 0.1× track, so its cost is
+   roughly constant while the full-file passes scale linearly. At 300 GB the full-file passes
+   dominate again — which is why round 3 attacks them and not the Δ-kernel.
+
 ## 2. Effect at a glance (BAM input, per run)
 
 | Cost | Before | After |
 |---|---|---|
-| Full decompress passes over the original file | 3 (count, downsample, unmapped) | 3, but the unmapped one **overlaps** the coverage branch |
+| Full decompress passes over the original file | 3 (count, downsample, unmapped) | **1** (`downsample`) with the round-3 flags; 2 with exact accounting |
 | Full-file rewrites (decompress + recompress + write) | 2 (`primary.bam`, and the `-N` copy) | 0 |
 | Whole-genome external sorts | 1 (spills tens of GB) | 0 |
 | Index builds on derived BAMs | 2 | 1 |
@@ -207,7 +249,19 @@ Each change has an environment switch, so you can isolate one at a time without 
 SINGLECHECK_LEGACY_AUTOCORR=1 ./SingleCheck …   # old sort-based aggregation
 SINGLECHECK_SCRATCH=0         ./SingleCheck …   # intermediates back on Lustre
 SINGLECHECK_NO_OVERLAP=1      ./SingleCheck …   # serial MetaPhyler branch
+SINGLECHECK_NO_FIFO=1         ./SingleCheck …   # write the shifted track to disk
+SINGLECHECK_COMPRESS_DS=1     ./SingleCheck …   # compress the transient BAM
+SINGLECHECK_INDEX_DEPTH=1     ./SingleCheck …   # depth from the index (estimate)
+SINGLECHECK_FAST_UNMAPPED=1   ./SingleCheck …   # '*'-block unmapped reads only
+SINGLECHECK_SKIP_METAPHYLER=1 ./SingleCheck …   # drop the contamination branch
 ```
+
+### 3.4 Ready-made runners
+
+| | what it does |
+|---|---|
+| `./runner.sh` | A/B vs `35ec840` in one job. Default: only bit-identical optimizations, `-T 1e-6`, so `CONSISTENT` stays meaningful. `--fast` adds the two estimating flags and raises the tolerance to 1e-2. |
+| `./runnerhuge.sh [bam]` | single production run with the full optimal flag set, after pre-flighting mosdepth, the index type, `samtools quickcheck`, the unmapped-read volume, Lustre striping and scratch capacity. |
 
 ---
 
@@ -277,8 +331,24 @@ of these optimizations and has drifted from `SingleCheck`. Either retire it in f
 
 ## 6. Correctness notes
 
+**Two round-3 changes are the first that can move the numbers**, unlike everything before them.
+Both are off unless the flag is set, and `bench/bench_stages.sh` quantifies each on your data:
+
+| Flag | What changes | How it is validated |
+|---|---|---|
+| `SINGLECHECK_INDEX_DEPTH=1` | columns 2–3 (*Sequenced bases*, *Analysis depth*) become an estimate: the index counts every alignment record, and the secondary/supplementary share is measured on the first million reads | `index_depth` vs `count_reads` prints the exact-vs-estimate error in % |
+| `SINGLECHECK_FAST_UNMAPPED=1` | MetaPhyler sees only unplaced unmapped reads; those whose mate is placed carry an RNAME and are skipped | `unmapped_fasta_fast` vs `unmapped_fasta` prints what fraction is skipped |
+
+The estimate rests on the same assumption the pipeline already made for the mean read length
+(`DOWNSAMPLING="ImpreciseSeqDepthCalc"`), so it is consistent with the existing contract — but it
+is a contract change for those two columns, and it should be stated wherever the outputs are
+documented.
+
 - The autocorrelation rewrite is an **exact** transformation (associative grouping), not an
   approximation, and the benchmark diffs it against the legacy output on real data.
+- The piped shifted track is byte-identical by construction — same awk, just not through a file.
+  Whether bedtools can read a process substitution is **probed at run time**, not assumed, and
+  the pipeline falls back to writing the file when it cannot.
 - The mapping-statistics rewrite is likewise exact; it reproduces `idxstats`' definitions of
   mapped/unmapped/MT counts over primary records.
 - `samtools view -s` sampling (item 2, done earlier) *is* a semantic change from Picard

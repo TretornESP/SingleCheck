@@ -51,6 +51,17 @@
 	                               (last output column becomes NA)
 	    SINGLECHECK_MOSDEPTH_THREADS=N
 	                               cap mosdepth's threads (default: all of -t)
+	    SINGLECHECK_INDEX_DEPTH=1  estimate the read count from the index instead of
+	                               a full counting pass. Removes one whole pass over
+	                               the input; makes 'Sequenced bases' an ESTIMATE
+	    SINGLECHECK_FAST_UNMAPPED=1
+	                               read only the unplaced-unmapped block ('*' region)
+	                               for MetaPhyler instead of scanning the whole file.
+	                               Excludes unmapped reads whose mate is placed
+	    SINGLECHECK_COMPRESS_DS=1  compress the transient downsampled BAM (default:
+	                               uncompressed, faster, a few GB more on scratch)
+	    SINGLECHECK_NO_FIFO=1      always materialise the shifted per-base track
+	                               instead of piping it into bedtools
 	    SINGLECHECK_STRICT_MODULES=1
 	                               abort when a 'module load' fails
 	"
@@ -229,6 +240,54 @@ fi
 ###//////////// PRINT A MESSAGE WITH ALL THE VARIABLES //////////
 
 ############################################################################
+#                        PHASE TIMING                                      #
+############################################################################
+# Every run measures itself: `phase <name>` closes the previous phase and opens
+# a new one, and the end of the script prints a table plus a .timings.tsv next
+# to the result. This costs one `date` per phase and is the only affordable way
+# to profile a multi-TB run (bench/bench_stages.sh re-runs each chunk N times,
+# which at that size is not an option). SINGLECHECK_NO_TIMING=1 disables it.
+PHASE_NAMES=()
+PHASE_SECS=()
+_phase_name=""
+_phase_t0=""
+_run_t0=$(date +%s.%N)
+
+phase() {
+    local now; now=$(date +%s.%N)
+    if [ -n "$_phase_name" ]; then
+        PHASE_NAMES+=("$_phase_name")
+        PHASE_SECS+=("$(awk -v a="$_phase_t0" -v b="$now" 'BEGIN{printf "%.3f", b-a}')")
+    fi
+    _phase_name="$1"
+    _phase_t0="$now"
+}
+
+print_timings() {
+    phase ""                     # close the last one
+    [ "${SINGLECHECK_NO_TIMING:-0}" = "1" ] && return 0
+    [ "${#PHASE_NAMES[@]}" -gt 0 ] || return 0
+    local total i tsv
+    total=$(awk -v a="$_run_t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.3f", b-a}')
+    tsv="${NAME}.SingleCheck.timings.tsv"
+    printf "phase\tseconds\tshare_pct\n" > "$tsv" 2>/dev/null
+    echo ""
+    echo "> Timing summary (wall clock)"
+    printf "  %-34s %10s %8s\n" "PHASE" "SECONDS" "SHARE"
+    for i in "${!PHASE_NAMES[@]}"; do
+        printf "  %-34s %10s %7.1f%%\n" "${PHASE_NAMES[$i]}" "${PHASE_SECS[$i]}" \
+            "$(awk -v s="${PHASE_SECS[$i]}" -v t="$total" 'BEGIN{print (t>0? s/t*100 : 0)}')"
+        printf "%s\t%s\t%.1f\n" "${PHASE_NAMES[$i]}" "${PHASE_SECS[$i]}" \
+            "$(awk -v s="${PHASE_SECS[$i]}" -v t="$total" 'BEGIN{print (t>0? s/t*100 : 0)}')" >> "$tsv" 2>/dev/null
+    done
+    printf "  %-34s %10s\n" "TOTAL" "$total"
+    printf "TOTAL\t%s\t100.0\n" "$total" >> "$tsv" 2>/dev/null
+    echo "  (also written to $tsv)"
+    echo "  Note: the MetaPhyler branch runs in parallel, so its cost shows up in"
+    echo "        'wait for MetaPhyler' only if it outlived the coverage branch."
+}
+
+############################################################################
 #                        LOAD MODULES                                      #
 ############################################################################
 # Every `module load` here is best-effort: a different cluster may name the
@@ -331,6 +390,27 @@ case "$MD_THREADS" in ''|*[!0-9]*) MD_THREADS=$THREADS ;; esac
 [ "$MD_THREADS" -lt 1 ] && MD_THREADS=1
 [ "$MD_THREADS" -gt "$THREADS" ] && MD_THREADS=$THREADS
 
+# Decoder threads for the passes that stop early (`| head -n 1000000`): more
+# than a handful is wasted because SIGPIPE arrives almost immediately.
+SAMPLE_THREADS=$THREADS
+[ "$SAMPLE_THREADS" -gt 4 ] && SAMPLE_THREADS=4
+
+# Sequencing-depth strategy (see the CALCULATE RAW SEQUENCING COVERAGE section):
+#   IndexOnlySeqDepthCalc  no pass over the input: index + a sampled fraction
+#   ImpreciseSeqDepthCalc  one `view -c` pass (exact primary count) [default]
+#   anything else          one full pass counting clipped bases too (slowest)
+if [ "${SINGLECHECK_INDEX_DEPTH:-0}" = "1" ]; then
+    DOWNSAMPLING="IndexOnlySeqDepthCalc"
+fi
+
+# Compression of the transient downsampled BAM: it is deleted at the end of the
+# run, so paying gzip for it is pure waste. `-u` (uncompressed) removes that CPU
+# from the critical path and mosdepth then reads it faster. Only for the SAMPLED
+# branch -- with -N on CRAM input the "downsampled" file is a full copy, which
+# must stay compressed.
+DS_BAMFMT="-u"
+[ "${SINGLECHECK_COMPRESS_DS:-0}" = "1" ] && DS_BAMFMT="-b"
+
 # Per-thread memory for `samtools sort` on the FASTQ path. Default (768M/thread)
 # either wastes RAM or OOM-kills the job depending on -t; derive it from what
 # SLURM actually granted and keep a safety margin (item 11 of HPC_OPTIMIZATION.md).
@@ -414,6 +494,7 @@ trap cleanup_scratch EXIT INT TERM
 # Set SINGLECHECK_STRICT_MODULES=1 to also abort when a `module load` failed,
 # even if the tool it provides was found elsewhere on $PATH.
 
+phase "dependency check"
 echo "> Checking dependencies"
 missing=0
 warnings=0
@@ -527,6 +608,24 @@ require_tool Rscript "R (Rscript)" 3.5 \
 # sort spill, it just runs slower.
 have pigz  || have bgzip || warn "neither pigz nor bgzip found -- the per-base track will be compressed with single-threaded gzip"
 have zstd  || warn "zstd not found -- sort spill files will be compressed with $SORTCOMP"
+
+# Can bedtools read a process substitution? If yes the shifted per-base track
+# never has to be written and re-read (one genome-sized gzip compress + one
+# decompress + the disk round-trip disappear). Probed instead of assumed,
+# because it depends on the bedtools build.
+BEDTOOLS_FIFO=0
+if have "$BEDTOOLS" && [ "${SINGLECHECK_NO_FIFO:-0}" != "1" ]; then
+    sc_probe="${SCRATCH}/.singlecheck_fifo_probe.$$.bed.gz"
+    if printf 'probe\t0\t2\t1\n' | gzip -c > "$sc_probe" 2>/dev/null; then
+        if "$BEDTOOLS" unionbedg -i <(zcat "$sc_probe") <(zcat "$sc_probe") >/dev/null 2>&1; then
+            BEDTOOLS_FIFO=1
+            found "bedtools reads process substitutions -- shifted track kept in a pipe"
+        else
+            warn "this bedtools cannot read process substitutions -- the shifted track will be written to disk"
+        fi
+    fi
+    rm -f "$sc_probe"
+fi
 
 # --- R packages used by the four metric scripts ------------------------------
 if have Rscript; then
@@ -794,9 +893,18 @@ fi
 printf "  track compressor   : %s   sort spill: %s\n" "$GZIP_CMD" "$SORTCOMP"
 if [ "${SINGLECHECK_LEGACY_AUTOCORR:-0}" = "1" ]; then
     printf "  autocorrelation    : legacy external sort\n"
+elif [ "$BEDTOOLS_FIFO" -eq 1 ]; then
+    printf "  autocorrelation    : sort-free aggregation, shifted track piped (no temp file)\n"
 else
-    printf "  autocorrelation    : sort-free streaming aggregation\n"
+    printf "  autocorrelation    : sort-free aggregation, shifted track on disk\n"
 fi
+case "$DOWNSAMPLING" in
+    IndexOnlySeqDepthCalc) printf "  sequencing depth   : from the index (no counting pass; ESTIMATE)\n" ;;
+    ImpreciseSeqDepthCalc) printf "  sequencing depth   : one exact counting pass over the input\n" ;;
+    *)                     printf "  sequencing depth   : full pass incl. clipped bases (slowest)\n" ;;
+esac
+[ "${SINGLECHECK_FAST_UNMAPPED:-0}" = "1" ] && printf "  unmapped reads     : '*' block only (index seek, subset of reads)\n"
+printf "  downsampled BAM    : %s\n" "$([ "$DS_BAMFMT" = "-u" ] && echo "uncompressed (transient)" || echo "compressed")"
 if [ "${SINGLECHECK_SKIP_METAPHYLER:-0}" = "1" ]; then
     printf "  MetaPhyler branch  : SKIPPED (no second full-file pass; contaminants = NA)\n"
 elif [ "${SINGLECHECK_NO_OVERLAP:-0}" = "1" ]; then
@@ -813,6 +921,7 @@ fi
 ############################################################################
 
 if [ "$METHOD" == "Paired-end" ] || [ "$METHOD" == "Single-end" ]; then
+    phase "alignment"
     if [ "$USE_GPU" -eq 1 ]; then
         # GPU path (item 8.1): Parabricks fq2bam does BWA-MEM + coordinate sort
         # on the GPU and emits a standard BAM the rest of the pipeline reads.
@@ -848,7 +957,7 @@ if [ ! -f ${ALNIDX} ]; then
         exit 1
 fi
 
-# Calculate genome length
+phase "genome length"
 genome_length=$(samtools view -H $SAMREF ${ALN} | grep "^@SQ" | awk '{sum+=substr($3,4,length($3)-1)}END{print sum}')
 #genome_length=$(cut -f2 ${RESDIR}/${REF}.fai | awk '{sum+=$1}END{print sum}')
 
@@ -857,12 +966,39 @@ genome_length=$(samtools view -H $SAMREF ${ALN} | grep "^@SQ" | awk '{sum+=subst
 # Primary alignments only (exclude supplementary 2048 + secondary 256) so reads
 # and clipped bases are not counted twice. Streamed in one pass -- no multi-TB
 # ${NAME}.primary.bam copy is written (Item 1 of HPC_OPTIMIZATION.md).
-if [ "$DOWNSAMPLING" = "ImpreciseSeqDepthCalc" ];then
+phase "sequencing depth"
+if [ "$DOWNSAMPLING" = "IndexOnlySeqDepthCalc" ];then
+	# NO PASS OVER THE INPUT AT ALL (item 3.1/3.3 taken to its conclusion).
+	# `samtools view -c` had to decompress the whole file just to count reads --
+	# hours on a 300 GB BAM. Instead:
+	#   * the TOTAL record count comes from the index (idxstats, milliseconds),
+	#     but it includes secondary/supplementary alignments;
+	#   * ONE sampled pass over the first million records -- the one this
+	#     pipeline already did for the read length -- also measures the
+	#     secondary/supplementary FRACTION, which converts that total into a
+	#     primary-record estimate.
+	# This is an estimate: it assumes the first million records are
+	# representative, exactly the assumption the mean read length already makes.
+	read mean_readlength secsupp_frac < <(samtools view -@ $SAMPLE_THREADS $SAMREF ${ALN} | \
+		head -n 1000000 | \
+		awk '{n++
+		      if (int($2/256)%2 || int($2/2048)%2) s++
+		      else {len+=length($10); p++}}
+		     END{if(p==0)p=1; if(n==0)n=1; printf "%.6f %.8f\n", len/p, s/n}')
+	total_records=$(samtools idxstats $SAMREF ${ALN} | awk '{t+=$3+$4}END{print t+0}')
+	raw_reads=$(awk -v t="$total_records" -v f="$secsupp_frac" 'BEGIN{printf "%.0f", t*(1-f)}')
+	raw_bases=$(awk -v meanl="$mean_readlength" -v rawr="$raw_reads" 'BEGIN{print rawr*meanl}')
+	echo "> Sequencing depth from the index: ${total_records} records, ${secsupp_frac} secondary/supplementary -> ${raw_reads} primary"
+elif [ "$DOWNSAMPLING" = "ImpreciseSeqDepthCalc" ];then
 	# Calculate total sequenced bases
 	# Count primary read-segments directly (no temp file, multithreaded decode)
 	raw_reads=$(samtools view -c -F 2304 -@ $THREADS $SAMREF ${ALN})
-	# Use the first million of reads to calculate average read length
-	mean_readlength=$(samtools view -F 2304 $SAMREF ${ALN} | head -n 1000000 | cut -f 10 | awk '{ print length }'| sort | uniq -c | awk '{sum+=$1*$2;num+=$1}END{print sum/num}')
+	# Use the first million of reads to calculate average read length.
+	# One awk instead of `cut | awk | sort | uniq -c | awk`: the old form ran an
+	# external sort over a million lines to build a frequency table whose only
+	# use was computing this mean. Same value, no sort.
+	mean_readlength=$(samtools view -F 2304 -@ $SAMPLE_THREADS $SAMREF ${ALN} | head -n 1000000 | \
+		awk '{len+=length($10); n++} END{if(n==0)n=1; printf "%.6f\n", len/n}')
 
 	raw_bases=$(awk -v meanl=$mean_readlength -v rawr=$raw_reads 'BEGIN{print rawr*meanl}')
 else
@@ -889,6 +1025,7 @@ sequencing_depth=$(awk -v gl=$genome_length -v rawb=$raw_bases 'BEGIN{print rawb
 #probability=$(awk -v ds_d=$downsampling_depth -v rs_d=$sequencing_depth 'BEGIN{print ds_d/rs_d}') 
 probability=`bc -l <<< "scale=10; $downsampling_depth / $sequencing_depth"`
 
+phase "downsample"
 if [[ ! -z $(awk -v prob=$probability 'BEGIN{if (prob >= 1) print "Lowest sequencing than downsampling selected"}') ]] || [[ "$DOWNSAMPLE" = "NO" ]]
 then
 	# Target depth >= actual (or -N): analyse the full file. The analysis handle is
@@ -908,7 +1045,7 @@ else
 	frac="${probability#0}"          # bc may emit ".0123" or "0.0123" -> ".0123"
 	subsample_arg="1${frac}"         # -> "1.0123" (seed.fraction)
 	echo "Downsampling with samtools view -s. From "${sequencing_depth}"X to "${downsampling_depth}"X. Fraction kept: "$probability
-	samtools view -b -@ $THREADS $SAMREF -s ${subsample_arg} ${ALN} -o ${WORKPFX}.${downsampling_depth}X.bam
+	samtools view $DS_BAMFMT -@ $THREADS $SAMREF -s ${subsample_arg} ${ALN} -o ${WORKPFX}.${downsampling_depth}X.bam
 	samtools index -@ $THREADS ${WORKPFX}.${downsampling_depth}X.bam
         DEPTH=$downsampling_depth
 fi
@@ -929,7 +1066,16 @@ MP_PID=""
 MP_THREADS=$(( THREADS / 4 ))
 [ "$MP_THREADS" -lt 1 ] && MP_THREADS=1
 metaphyler_branch() {
-    samtools view -f 0x4 -@ $MP_THREADS $SAMREF ${ALN} | awk '{OFS="\t"; print ">"$1"\n"$10}' > ${WORKPFX}.unmapped.fasta
+    # In a coordinate-sorted indexed file the unplaced unmapped reads live in
+    # their own block at the end, and the index can seek straight to it: the
+    # '*' region turns a FULL scan of the input into a read of a tiny fraction
+    # (item 3.3). It does NOT include unmapped reads whose mate is placed (they
+    # carry an RNAME), so the read set is a subset -- hence the switch.
+    if [ "${SINGLECHECK_FAST_UNMAPPED:-0}" = "1" ]; then
+        samtools view -f 0x4 -@ $MP_THREADS $SAMREF ${ALN} '*' | awk '{OFS="\t"; print ">"$1"\n"$10}' > ${WORKPFX}.unmapped.fasta
+    else
+        samtools view -f 0x4 -@ $MP_THREADS $SAMREF ${ALN} | awk '{OFS="\t"; print ">"$1"\n"$10}' > ${WORKPFX}.unmapped.fasta
+    fi
     if ! "$METAPHYLER" 2 ${WORKPFX}.unmapped.fasta ${WORKPFX} || [ ! -s ${WORKPFX}.genus.tab ]; then
         printf "\nWarning: MetaPhyler did not produce %s.genus.tab -- the contaminants\n" "${WORKPFX}" >&2
         printf "         column will be NA. Every other metric is unaffected.\n" >&2
@@ -947,6 +1093,7 @@ else
     MP_PID=$!
 fi
 
+phase "mosdepth"
 echo "> Running mosdepth"
         # the number of floats I need for mosdepth depends on the window size
 	# wc -c gives an extra character (\n). window size of 100 (3 chars) -> minimum coverage will be 0.01 (2 decs)
@@ -980,12 +1127,25 @@ echo "> Running mosdepth"
 # Only meaningful when mosdepth came from the conda env activated above.
 command -v conda >/dev/null 2>&1 && conda deactivate
 
+# The shift applied to the per-base track to build the second (lagged) input.
+# Kept in one place because it is now used either into a file or into a pipe.
+SHIFT_AWK='{if (print_switch==1) {start=$2-alpha; if (start<0) {print $1"\t"0"\t"$3-alpha"\t"$4} else{print $1"\t"start"\t"$3-alpha"\t"$4}}
+        else if (alpha >= $2 && alpha < $3) {start=$2-alpha;if (start<0) {print $1"\t"0"\t"$3-alpha"\t"$4} else {print $1"\t"start"\t"$3-alpha"\t"$4}; print_switch=1}}'
+
+phase "autocorrelation input"
 echo "> Creating input for autocorrelation"
-        zcat ${WORKPFX}.${WSIZE}.per-base.bed.gz | \
-        awk -v alpha=$DELTA -v print_switch=0 \
-        '{if (print_switch==1) {start=$2-alpha; if (start<0) {print $1"\t"0"\t"$3-alpha"\t"$4} else{print $1"\t"start"\t"$3-alpha"\t"$4}}
-        else if (alpha >= $2 && alpha < $3) {start=$2-alpha;if (start<0) {print $1"\t"0"\t"$3-alpha"\t"$4} else {print $1"\t"start"\t"$3-alpha"\t"$4}; print_switch=1}}' | \
-        $GZIP_CMD > ${WORKPFX}.${WSIZE}.${DELTA}.bed.gz
+        # When bedtools can read a process substitution (probed in CHECK
+        # DEPENDENCIES) the shifted track goes straight into it: one
+        # genome-sized gzip compress, one decompress and a disk round-trip
+        # disappear. Otherwise fall back to materialising it, as before.
+        if [ "$BEDTOOLS_FIFO" -eq 1 ] && [ "${SINGLECHECK_LEGACY_AUTOCORR:-0}" != "1" ]; then
+            SHIFTED_TRACK="/dev/null"     # nothing is written
+        else
+            zcat ${WORKPFX}.${WSIZE}.per-base.bed.gz | \
+            awk -v alpha=$DELTA -v print_switch=0 "$SHIFT_AWK" | \
+            $GZIP_CMD > ${WORKPFX}.${WSIZE}.${DELTA}.bed.gz
+            SHIFTED_TRACK="${WORKPFX}.${WSIZE}.${DELTA}.bed.gz"
+        fi
 
         # The union of the two tracks is grouped by the (depth, shifted depth)
         # pair. The old code did that by sorting the WHOLE per-base genome track
@@ -1010,6 +1170,14 @@ echo "> Creating input for autocorrelation"
             else{diff=diff+($3-$2);value1=$4;value2=$5}
             }END{print value1"\t"value2"\t"diff}' \
             > ${WORKPFX}.${DELTA}.shiftedcov.txt
+        elif [ "$BEDTOOLS_FIFO" -eq 1 ]; then
+            "$BEDTOOLS" unionbedg -filler NA \
+            -i <(zcat ${WORKPFX}.${WSIZE}.per-base.bed.gz) \
+               <(zcat ${WORKPFX}.${WSIZE}.per-base.bed.gz | awk -v alpha=$DELTA -v print_switch=0 "$SHIFT_AWK") | \
+            grep -E "$DIPLOID_REGEX" | \
+            awk '{pair[$4"\t"$5] += $3-$2}
+                 END{for (p in pair) print p"\t"pair[p]}' \
+            > ${WORKPFX}.${DELTA}.shiftedcov.txt
         else
             "$BEDTOOLS" unionbedg -filler NA  \
             -i ${WORKPFX}.${WSIZE}.per-base.bed.gz \
@@ -1020,6 +1188,7 @@ echo "> Creating input for autocorrelation"
             > ${WORKPFX}.${DELTA}.shiftedcov.txt
         fi
 
+phase "gini/cv input + R"
 echo "> Calculating gini and cv"
         # Create a frequency table
         zcat ${WORKPFX}.${WSIZE}.regions.bed.gz | \
@@ -1033,11 +1202,13 @@ echo "> Calculating gini and cv"
 Rscript ${SCRIPTDIR}/src/GiniIndex.R ${WORKPFX}.${WSIZE} $WSIZE
 Rscript ${SCRIPTDIR}/src/CoefficientOfVariation.R ${WORKPFX}.${WSIZE}
 
+phase "autocorrelation R"
 echo "> Calculating autocorrelation"
 
 Rscript ${SCRIPTDIR}/src/Autocorrelation.R ${WORKPFX}.${DELTA} $DELTA
 
 
+phase "MAD input + R"
 echo "> Calculating MAD"
 
         # Paste values from consecutive windows together
@@ -1067,6 +1238,7 @@ Rscript ${SCRIPTDIR}/src/MAD.R ${WORKPFX}.${WSIZE}
 #   idxstats col3 (mapped)   == primary records with flag 0x4 clear
 #   idxstats col4 (unmapped) == primary records with flag 0x4 set
 #   MT_mappedreads           == mapped primary records whose RNAME matches $MT_REGEX
+phase "mapping statistics"
 read mt_perc_totalreads unmapped_perc_totalreads < <(
     samtools view -F 2304 -@ $THREADS $SAMREF ${WORKPFX}.${downsampling_depth}X.bam | \
     awk -v mtre="$MT_REGEX" '
@@ -1080,12 +1252,14 @@ breadth=$(awk '{if ($1==0){sum+=$3}else if ($1!="NA"){rest+=$3}}END{print 100 - 
 # The contaminants column is the only thing that needs the MetaPhyler branch:
 # join it here, at the last possible moment, so its full-file scan had the whole
 # coverage branch to overlap with (item 5.3).
+phase "wait for MetaPhyler"
 if [ -n "$MP_PID" ]; then
     echo "> Waiting for the MetaPhyler branch"
     wait "$MP_PID"
     [ -f ${WORKPFX}.metaphyler.log ] && cat ${WORKPFX}.metaphyler.log
 fi
 
+phase "finalize"
 if [ -s ${WORKPFX}.genus.tab ]; then
     class=$(awk '{if ($1 !~ "{") print $0}' ${WORKPFX}.genus.tab | grep -v "^@" | awk '{print $1"-"$2"-"$3"-"$4"-"$5}' | tr -s '\n' ',' | sed 's/,$/\n/')
 else
@@ -1122,5 +1296,7 @@ fi
 
 printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$SAMPLE" "$raw_bases" "$DEPTH" "$WSIZE" "$DELTA" "$unmapped_perc_totalreads" "$mt_perc_totalreads" "$breadth" "$autocorrelation" "$CV" "$gini" "$MAD" "$class" > ${NAME}.SingleCheck.txt
 
+
+print_timings
 
 echo "> Finished!"

@@ -28,6 +28,11 @@
 #       --strict         abort when the dependency check finds a problem, exactly
 #                        like ../SingleCheck. Default: report it and measure the
 #                        chunks that CAN run, skipping the rest.
+#       --work-scratch   keep the intermediates on node-local scratch ($SLURM_TMPDIR)
+#                        the way ../SingleCheck does. Without it the text chunks
+#                        are timed against the shared filesystem, which
+#                        understates the optimized pipeline. Artifacts are lost
+#                        when the job ends.
 #       --no-compare     do not run the LEGACY variants of the optimized chunks.
 #                        By default the benchmark runs both the old and the new
 #                        implementation of the two rewritten steps, times them
@@ -121,13 +126,31 @@ stage_genome_length() {
 stage_count_reads() {
     raw_reads=$(samtools view -c -F 2304 -@ $THREADS $SAMREF ${ALN})
     emit raw_reads "$raw_reads"
+    printf "%s\n" "$raw_reads" > ${NAME}.rawreads.exact.txt
     echo "raw_reads=$raw_reads"
 }
 
 stage_mean_readlen() {
-    mean_readlength=$(samtools view -F 2304 $SAMREF ${ALN} | head -n 1000000 | cut -f 10 | awk '{ print length }'| sort | uniq -c | awk '{sum+=$1*$2;num+=$1}END{print sum/num}')
+    mean_readlength=$(samtools view -F 2304 -@ $SAMPLE_THREADS $SAMREF ${ALN} | head -n 1000000 | \
+        awk '{len+=length($10); n++} END{if(n==0)n=1; printf "%.6f\n", len/n}')
     emit mean_readlength "$mean_readlength"
     echo "mean_readlength=$mean_readlength"
+}
+
+# NEW: no pass over the input at all -- index total x sampled primary fraction.
+# Writes its estimate to a file instead of emitting it, so the rest of the
+# benchmark keeps using the exact count from count_reads.
+stage_index_depth() {
+    read md_mean_readlength secsupp_frac < <(samtools view -@ $SAMPLE_THREADS $SAMREF ${ALN} | \
+        head -n 1000000 | \
+        awk '{n++
+              if (int($2/256)%2 || int($2/2048)%2) s++
+              else {len+=length($10); p++}}
+             END{if(p==0)p=1; if(n==0)n=1; printf "%.6f %.8f\n", len/p, s/n}')
+    total_records=$(samtools idxstats $SAMREF ${ALN} | awk '{t+=$3+$4}END{print t+0}')
+    awk -v t="$total_records" -v f="$secsupp_frac" 'BEGIN{printf "%.0f\n", t*(1-f)}' > ${NAME}.rawreads.index.txt
+    printf "total_records=%s secsupp_frac=%s raw_reads=%s mean_readlength=%s\n" \
+        "$total_records" "$secsupp_frac" "$(cat ${NAME}.rawreads.index.txt)" "$md_mean_readlength"
 }
 
 # Pure arithmetic (awk + bc): raw bases, depth, downsampling probability.
@@ -166,7 +189,7 @@ stage_downsample() {
         frac="${probability#0}"          # bc may emit ".0123" or "0.0123" -> ".0123"
         subsample_arg="1${frac}"         # -> "1.0123" (seed.fraction)
         echo "Downsampling from ${sequencing_depth}X to ${downsampling_depth}X. Fraction kept: $probability"
-        samtools view -b -@ $THREADS $SAMREF -s ${subsample_arg} ${ALN} -o ${NAME}.${downsampling_depth}X.bam
+        samtools view $DS_BAMFMT -@ $THREADS $SAMREF -s ${subsample_arg} ${ALN} -o ${NAME}.${downsampling_depth}X.bam
     fi
 }
 
@@ -233,6 +256,23 @@ stage_unionbedg_hash() {
     cp ${NAME}.${DELTA}.shiftedcov.fast.txt ${NAME}.${DELTA}.shiftedcov.txt
 }
 
+# CURRENT DEFAULT when bedtools accepts process substitutions: shift + union +
+# aggregate in ONE pipeline, so the shifted track is never written or re-read.
+# Replaces shift_track + unionbedg_hash together.
+stage_autocorr_fifo() {
+    "$BEDTOOLS" unionbedg -filler NA \
+    -i <(zcat ${NAME}.${WSIZE}.per-base.bed.gz) \
+       <(zcat ${NAME}.${WSIZE}.per-base.bed.gz | \
+         awk -v alpha=$DELTA -v print_switch=0 \
+         '{if (print_switch==1) {start=$2-alpha; if (start<0) {print $1"\t"0"\t"$3-alpha"\t"$4} else{print $1"\t"start"\t"$3-alpha"\t"$4}}
+         else if (alpha >= $2 && alpha < $3) {start=$2-alpha;if (start<0) {print $1"\t"0"\t"$3-alpha"\t"$4} else {print $1"\t"start"\t"$3-alpha"\t"$4}; print_switch=1}}') | \
+    grep -E "$DIPLOID_REGEX" | \
+    awk '{pair[$4"\t"$5] += $3-$2}
+         END{for (p in pair) print p"\t"pair[p]}' \
+    > ${NAME}.${DELTA}.shiftedcov.fifo.txt
+    cp ${NAME}.${DELTA}.shiftedcov.fifo.txt ${NAME}.${DELTA}.shiftedcov.txt
+}
+
 # --- gini / cv input + R -----------------------------------------------------
 stage_freq_table() {
     zcat ${NAME}.${WSIZE}.regions.bed.gz | \
@@ -275,6 +315,15 @@ stage_mad_R() {
 # --- contamination (full original file) --------------------------------------
 stage_unmapped_fasta() {
     samtools view -f 0x4 -@ $THREADS $SAMREF ${ALN} | awk '{OFS="\t"; print ">"$1"\n"$10}' > ${NAME}.unmapped.fasta
+    grep -c '^>' ${NAME}.unmapped.fasta > ${NAME}.unmapped.count.txt
+}
+
+# NEW: index-seek to the unplaced-unmapped block instead of scanning the file.
+# Separate output so the read sets can be compared.
+stage_unmapped_fasta_fast() {
+    samtools view -f 0x4 -@ $THREADS $SAMREF ${ALN} '*' | awk '{OFS="\t"; print ">"$1"\n"$10}' > ${NAME}.unmapped.fast.fasta
+    grep -c '^>' ${NAME}.unmapped.fast.fasta > ${NAME}.unmapped.fast.count.txt
+    cat ${NAME}.unmapped.fast.count.txt
 }
 
 # ../SingleCheck only warns here and carries on with class=NA; the benchmark
@@ -359,7 +408,8 @@ set -uo pipefail
 #                        3. OPTIONS                                           #
 ###############################################################################
 INPUT="" ; INPUT2="" ; REPS=3 ; OUTDIR="" ; STAGES_CSV="" ; LIST=0
-WARMUP=0 ; FULL=0 ; CLEAN=0 ; STRICT=0 ; COMPARE=1 ; ENVFILE="${SINGLECHECK_ENV:-}"
+WARMUP=0 ; FULL=0 ; CLEAN=0 ; STRICT=0 ; COMPARE=1 ; WORKSCRATCH=0
+ENVFILE="${SINGLECHECK_ENV:-}"
 
 # pipeline defaults -- kept identical to ../SingleCheck
 WSIZE=10000000
@@ -386,6 +436,7 @@ while [ "$#" -gt 0 ]; do
     --full)          FULL=1; shift ;;
     --strict)        STRICT=1; shift ;;
     --no-compare)    COMPARE=0; shift ;;
+    --work-scratch)  WORKSCRATCH=1; shift ;;
     --env)           ENVFILE="$2"; shift 2 ;;
     --keep)          CLEAN=0; shift ;;
     --clean)         CLEAN=1; shift ;;
@@ -412,8 +463,9 @@ Chunks, in pipeline order (key -- what it runs):
   align            bwa-mem2/bwa mem | samtools sort ; samtools index   [FASTQ input only]
   align_gpu        pbrun fq2bam (NVIDIA Parabricks)                    [FASTQ + GPU only]
   genome_length    samtools view -H | grep @SQ | awk
-  count_reads      samtools view -c -F 2304                            [full input file]
-  mean_readlen     samtools view | head -1000000 | cut | sort | uniq   [full input file]
+  count_reads      LEGACY: samtools view -c -F 2304                    [full input file]
+  mean_readlen     samtools view | head -1000000 | awk (mean length)
+  index_depth      idxstats + sampled primary fraction  [NO pass over the input]
   seq_depth        awk + bc arithmetic (bases, depth, probability)
   downsample       samtools view -b -s SEED.FRACTION                   [full input file]
   index_ds         samtools index (downsampled BAM)
@@ -421,13 +473,15 @@ Chunks, in pipeline order (key -- what it runs):
   shift_track      zcat per-base | awk shift | pigz/bgzip/gzip
   unionbedg_sort   LEGACY: unionbedg | grep | sort --version-sort | awk RLE
   unionbedg_hash   unionbedg | grep | awk hash accumulator (no external sort)
+  autocorr_fifo    shift+union+aggregate in one pipeline (no shifted track on disk)
   freq_table       zcat regions | grep | awk | sort | uniq -c | awk
   gini_R           Rscript src/GiniIndex.R
   cv_R             Rscript src/CoefficientOfVariation.R
   autocorr_R       Rscript src/Autocorrelation.R
   contiguous       zcat regions | paste | grep | awk | sort | uniq -c
   mad_R            Rscript src/MAD.R
-  unmapped_fasta   samtools view -f 0x4 | awk                          [full input file]
+  unmapped_fasta   LEGACY: samtools view -f 0x4 | awk                  [full input file]
+  unmapped_fasta_fast  samtools view -f 0x4 '*'  [index seek to the unmapped block]
   metaphyler       metaphyler.pl (contamination)
   primary_bam_legacy  LEGACY: samtools view -bF 2304 copy + samtools index
   idxstats_legacy     LEGACY: samtools idxstats x3 + awk
@@ -526,6 +580,13 @@ case "$MD_THREADS" in ''|*[!0-9]*) MD_THREADS=$THREADS ;; esac
 [ "$MD_THREADS" -lt 1 ] && MD_THREADS=1
 [ "$MD_THREADS" -gt "$THREADS" ] && MD_THREADS=$THREADS
 
+SAMPLE_THREADS=$THREADS
+[ "$SAMPLE_THREADS" -gt 4 ] && SAMPLE_THREADS=4
+
+# transient downsampled BAM: uncompressed by default, same as ../SingleCheck
+DS_BAMFMT="-u"
+[ "${SINGLECHECK_COMPRESS_DS:-0}" = "1" ] && DS_BAMFMT="-b"
+
 sort_mem_mb=0
 if [ -n "${SLURM_MEM_PER_NODE:-}" ]; then
     sort_mem_mb=$(( ${SLURM_MEM_PER_NODE%%[!0-9]*} * 70 / 100 / THREADS ))
@@ -546,6 +607,27 @@ OUTDIR="${OUTDIR:-$BENCHDIR/stages_$(hostname -s)_${STAMP}}"
 mkdir -p "$OUTDIR/logs" "$OUTDIR/work" || exit 1
 OUTDIR="$(cd "$OUTDIR" && pwd -P)"
 WORK="$OUTDIR/work"
+
+# --work-scratch: put the intermediates on node-local scratch, the way
+# ../SingleCheck now does. Without this the chunks that read and write the
+# per-base track are timed against the SHARED filesystem, which understates the
+# optimized pipeline. The artifacts die with the job, so --keep cannot apply.
+SCRATCHWORK=""
+if [ "$WORKSCRATCH" -eq 1 ]; then
+  if [ -d "$SCRATCH" ] && [ -w "$SCRATCH" ]; then
+    SCRATCHWORK="${SCRATCH}/bench_stages.${SLURM_JOB_ID:-$$}"
+    if mkdir -p "$SCRATCHWORK"; then
+      WORK="$SCRATCHWORK"
+      trap 'rm -rf "$SCRATCHWORK"' EXIT INT TERM
+      echo "  work dir on node-local scratch: $WORK (removed when the job ends)"
+    else
+      SCRATCHWORK=""
+      echo "  [WARN] could not create a work dir under $SCRATCH -- using $WORK" >&2
+    fi
+  else
+    echo "  [WARN] --work-scratch requested but $SCRATCH is not writable -- using $WORK" >&2
+  fi
+fi
 STATE="$OUTDIR/state.env"
 BENCH_VALS="$OUTDIR/vals.env"
 TIMINGS="$OUTDIR/timings.tsv"
@@ -910,7 +992,7 @@ STATE_VARS=(FILE FASTQ1 FASTQ2 METHOD NAME ALN ALNIDX SAMREF REFERENCE THREADS
             WSIZE DELTA FLAGTOFILTEROUT MAPQUAL DIPLOID_REGEX MT_REGEX
             downsampling_depth ds_strategy DOWNSAMPLE SCRATCH SORTCOMP GZIP_CMD
             MOSDEPTH BEDTOOLS METAPHYLER SRCDIR WORK BENCH_VALS ALIGNER
-            MD_THREADS SORTMEM
+            MD_THREADS SORTMEM SAMPLE_THREADS DS_BAMFMT
             genome_length raw_reads mean_readlength raw_bases sequencing_depth
             probability DEPTH DS_MODE)
 
@@ -949,10 +1031,12 @@ fi
 
 add_stage genome_length "Raw depth" "samtools view -H | awk (genome length)" \
   "samtools" "$ALN" ""
-add_stage count_reads "Raw depth" "samtools view -c -F 2304 (full file)" \
+add_stage count_reads "Raw depth" "LEGACY: samtools view -c -F 2304 (full pass over the input)" \
+  "samtools" "$ALN" "${NAME}.rawreads.exact.txt"
+add_stage mean_readlen "Raw depth" "samtools view | head -1e6 | awk (mean length)" \
   "samtools" "$ALN" ""
-add_stage mean_readlen "Raw depth" "samtools view | head -1e6 | sort | uniq -c" \
-  "samtools" "$ALN" ""
+add_stage index_depth "Raw depth" "idxstats + sampled primary fraction (NO pass over the input)" \
+  "samtools" "$ALN" "${NAME}.rawreads.index.txt"
 add_stage seq_depth "Raw depth" "awk + bc (bases, depth, probability)" \
   "bc" "" ""
 add_stage downsample "Downsampling" "samtools view -b -s (full file)" \
@@ -972,6 +1056,9 @@ fi
 add_stage unionbedg_hash "Autocorrelation" "bedtools unionbedg | grep | awk hash (sort-free)" \
   "$BEDTOOLS" "${NAME}.${WSIZE}.per-base.bed.gz ${NAME}.${WSIZE}.${DELTA}.bed.gz" \
   "${NAME}.${DELTA}.shiftedcov.fast.txt ${NAME}.${DELTA}.shiftedcov.txt"
+add_stage autocorr_fifo "Autocorrelation" "shift+union+aggregate in one pipeline (no shifted track on disk)" \
+  "$BEDTOOLS" "${NAME}.${WSIZE}.per-base.bed.gz" \
+  "${NAME}.${DELTA}.shiftedcov.fifo.txt ${NAME}.${DELTA}.shiftedcov.txt"
 add_stage freq_table "Gini/CV" "zcat regions | sort | uniq -c (freq table)" \
   "zcat" "${NAME}.${WSIZE}.regions.bed.gz" "${NAME}.${WSIZE}.freqs.txt"
 add_stage gini_R "Gini/CV" "Rscript GiniIndex.R" \
@@ -984,8 +1071,10 @@ add_stage contiguous "MAD" "zcat regions | paste | sort | uniq -c" \
   "zcat" "${NAME}.${WSIZE}.regions.bed.gz" "${NAME}.${WSIZE}.contiguous.txt"
 add_stage mad_R "MAD" "Rscript MAD.R" \
   "Rscript" "${NAME}.${WSIZE}.contiguous.txt" "${WORK}/MAD.${SAMPLE}.${WSIZE}.txt"
-add_stage unmapped_fasta "Contamination" "samtools view -f 0x4 | awk (full file)" \
-  "samtools" "$ALN" "${NAME}.unmapped.fasta"
+add_stage unmapped_fasta "Contamination" "LEGACY: samtools view -f 0x4 | awk (full pass over the input)" \
+  "samtools" "$ALN" "${NAME}.unmapped.fasta ${NAME}.unmapped.count.txt"
+add_stage unmapped_fasta_fast "Contamination" "samtools view -f 0x4 '*' (index seek to the unmapped block)" \
+  "samtools" "$ALN" "${NAME}.unmapped.fast.fasta ${NAME}.unmapped.fast.count.txt"
 add_stage metaphyler "Contamination" "metaphyler.pl" \
   "$METAPHYLER" "${NAME}.unmapped.fasta" ""
 if [ "$COMPARE" -eq 1 ]; then
@@ -1151,6 +1240,37 @@ if [ "$COMPARE" -eq 1 ]; then
       EQUIV_LINES+=("| \`unionbedg_hash\` vs \`unionbedg_sort\` | **DIFFERS** | $nd differing rows -- see work/ |")
       echo "      shiftedcov: DIFFERS ($nd rows)" >&2
     fi
+  fi
+
+  # the one-pipeline variant must agree with the legacy sort as well
+  fifo="${NAME}.${DELTA}.shiftedcov.fifo.txt"
+  if [ -s "$legacy" ] && [ -s "$fifo" ]; then
+    if diff -q <(sort "$legacy") <(sort "$fifo") >/dev/null 2>&1; then
+      EQUIV_LINES+=("| \`autocorr_fifo\` vs \`unionbedg_sort\` | **identical** | $(wc -l < "$fifo") rows |")
+      echo "      shiftedcov (fifo): IDENTICAL"
+    else
+      nd=$(diff <(sort "$legacy") <(sort "$fifo") | grep -c '^[<>]')
+      EQUIV_LINES+=("| \`autocorr_fifo\` vs \`unionbedg_sort\` | **DIFFERS** | $nd differing rows |")
+      echo "      shiftedcov (fifo): DIFFERS ($nd rows)" >&2
+    fi
+  fi
+
+  # index-only depth estimate vs the exact counting pass: how big is the error?
+  if [ -s "${NAME}.rawreads.exact.txt" ] && [ -s "${NAME}.rawreads.index.txt" ]; then
+    exact=$(cat "${NAME}.rawreads.exact.txt"); est=$(cat "${NAME}.rawreads.index.txt")
+    relerr=$(awk -v a="$exact" -v b="$est" 'BEGIN{d=b-a; if(d<0)d=-d; printf "%.4f", (a>0? d/a*100 : 0)}')
+    verdict="**estimate**"
+    awk -v r="$relerr" 'BEGIN{exit (r<1.0)?0:1}' || verdict="**check this**"
+    EQUIV_LINES+=("| \`index_depth\` vs \`count_reads\` | $verdict | exact $exact vs $est reads = ${relerr}% error |")
+    echo "      raw_reads:  exact=$exact estimate=$est (${relerr}% error)"
+  fi
+
+  # '*'-region unmapped extraction: how many reads does it miss?
+  if [ -s "${NAME}.unmapped.count.txt" ] && [ -s "${NAME}.unmapped.fast.count.txt" ]; then
+    allu=$(cat "${NAME}.unmapped.count.txt"); fastu=$(cat "${NAME}.unmapped.fast.count.txt")
+    miss=$(awk -v a="$allu" -v b="$fastu" 'BEGIN{printf "%.2f", (a>0? (a-b)/a*100 : 0)}')
+    EQUIV_LINES+=("| \`unmapped_fasta_fast\` vs \`unmapped_fasta\` | **subset** | $fastu of $allu reads (${miss}% are mate-placed and skipped) |")
+    echo "      unmapped:   full=$allu '*'-only=$fastu (${miss}% skipped)"
   fi
 
   # mapping statistics: two floats, compare with a relative tolerance
