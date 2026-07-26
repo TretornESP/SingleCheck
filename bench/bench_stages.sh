@@ -520,8 +520,11 @@ elif command -v bgzip >/dev/null 2>&1; then GZIP_CMD="bgzip -@ $THREADS -c"
 else GZIP_CMD="gzip -c"; fi
 
 # Same thread split and sort sizing as ../SingleCheck (items 5.1, 6.6, 11).
-MD_THREADS=$THREADS
-[ "$MD_THREADS" -gt 4 ] && MD_THREADS=4
+# No mosdepth cap by default: measured slower at -t 4 than at -t 32.
+MD_THREADS="${SINGLECHECK_MOSDEPTH_THREADS:-$THREADS}"
+case "$MD_THREADS" in ''|*[!0-9]*) MD_THREADS=$THREADS ;; esac
+[ "$MD_THREADS" -lt 1 ] && MD_THREADS=1
+[ "$MD_THREADS" -gt "$THREADS" ] && MD_THREADS=$THREADS
 
 sort_mem_mb=0
 if [ -n "${SLURM_MEM_PER_NODE:-}" ]; then

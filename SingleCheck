@@ -45,6 +45,12 @@
 	    SINGLECHECK_LEGACY_AUTOCORR=1
 	                               use the old external-sort autocorrelation path
 	    SINGLECHECK_NO_OVERLAP=1   run the MetaPhyler branch serially, not in parallel
+	    SINGLECHECK_SKIP_METAPHYLER=1
+	                               skip contamination detection entirely: saves one
+	                               full pass over the input and a multi-GB FASTA
+	                               (last output column becomes NA)
+	    SINGLECHECK_MOSDEPTH_THREADS=N
+	                               cap mosdepth's threads (default: all of -t)
 	    SINGLECHECK_STRICT_MODULES=1
 	                               abort when a 'module load' fails
 	"
@@ -316,10 +322,14 @@ if command -v pigz >/dev/null 2>&1; then GZIP_CMD="pigz -c -p $THREADS"
 elif command -v bgzip >/dev/null 2>&1; then GZIP_CMD="bgzip -@ $THREADS -c"
 else GZIP_CMD="gzip -c"; fi
 
-# mosdepth's BAM decompression stops scaling at ~4 threads (HPC_OPTIMIZATION.md
-# 5.1); handing it 32 only wastes cores that samtools/sort could be using.
-MD_THREADS=$THREADS
-[ "$MD_THREADS" -gt 4 ] && MD_THREADS=4
+# HPC_OPTIMIZATION.md 5.1 claims mosdepth stops scaling at ~4 threads, so this
+# used to be capped at 4. MEASURED on Wang5.bam: 57.0 s with -t 32 vs 61.2 s
+# with -t 4 -- the cap made it slower, so it is off by default. Set
+# SINGLECHECK_MOSDEPTH_THREADS to cap it if your data says otherwise.
+MD_THREADS="${SINGLECHECK_MOSDEPTH_THREADS:-$THREADS}"
+case "$MD_THREADS" in ''|*[!0-9]*) MD_THREADS=$THREADS ;; esac
+[ "$MD_THREADS" -lt 1 ] && MD_THREADS=1
+[ "$MD_THREADS" -gt "$THREADS" ] && MD_THREADS=$THREADS
 
 # Per-thread memory for `samtools sort` on the FASTQ path. Default (768M/thread)
 # either wastes RAM or OOM-kills the job depending on -t; derive it from what
@@ -547,7 +557,12 @@ else
 fi
 
 # --- Metaphyler (contamination detection) and the BLAST it shells out to -----
-if [ ! -f "$METAPHYLER" ]; then
+# The whole branch can be disabled: it costs a FULL extra pass over the input
+# plus an uncompressed FASTA of every unmapped read (tens of GB on a multi-TB
+# file), and it only feeds the last output column.
+if [ "${SINGLECHECK_SKIP_METAPHYLER:-0}" = "1" ]; then
+    found "MetaPhyler branch disabled (SINGLECHECK_SKIP_METAPHYLER=1) -- contaminants column will be NA"
+elif [ ! -f "$METAPHYLER" ]; then
     err "Metaphyler not found at $METAPHYLER (set \$METAPHYLER to the full path of metaphyler.pl)"
 elif [ ! -x "$METAPHYLER" ]; then
     err "Metaphyler at $METAPHYLER is not executable (chmod +x it)"
@@ -782,7 +797,9 @@ if [ "${SINGLECHECK_LEGACY_AUTOCORR:-0}" = "1" ]; then
 else
     printf "  autocorrelation    : sort-free streaming aggregation\n"
 fi
-if [ "${SINGLECHECK_NO_OVERLAP:-0}" = "1" ]; then
+if [ "${SINGLECHECK_SKIP_METAPHYLER:-0}" = "1" ]; then
+    printf "  MetaPhyler branch  : SKIPPED (no second full-file pass; contaminants = NA)\n"
+elif [ "${SINGLECHECK_NO_OVERLAP:-0}" = "1" ]; then
     printf "  MetaPhyler branch  : serial\n"
 else
     printf "  MetaPhyler branch  : overlapped with the coverage branch\n"
@@ -907,7 +924,9 @@ fi
 MP_PID=""
 # Split the cores: mosdepth saturates at $MD_THREADS, so the rest can decode
 # the unmapped scan without either branch starving the other.
-MP_THREADS=$(( THREADS - MD_THREADS ))
+# The background scan gets a quarter of the cores: it is I/O bound, and the
+# foreground mosdepth/text branch should keep the rest.
+MP_THREADS=$(( THREADS / 4 ))
 [ "$MP_THREADS" -lt 1 ] && MP_THREADS=1
 metaphyler_branch() {
     samtools view -f 0x4 -@ $MP_THREADS $SAMREF ${ALN} | awk '{OFS="\t"; print ">"$1"\n"$10}' > ${WORKPFX}.unmapped.fasta
@@ -917,7 +936,9 @@ metaphyler_branch() {
         printf "         Check the installation at %s\n" "$METAPHYLER" >&2
     fi
 }
-if [ "${SINGLECHECK_NO_OVERLAP:-0}" = "1" ]; then
+if [ "${SINGLECHECK_SKIP_METAPHYLER:-0}" = "1" ]; then
+    echo "> METAPHYLER skipped (SINGLECHECK_SKIP_METAPHYLER=1): no unmapped scan, contaminants = NA"
+elif [ "${SINGLECHECK_NO_OVERLAP:-0}" = "1" ]; then
     echo "> METAPHYLER (serial)"
     metaphyler_branch
 else
