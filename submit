@@ -28,7 +28,9 @@
 #   -h | --help          show this help
 #
 # EXAMPLES
-#   ./submit SingleCheck -w 10000000 -t 8 sample.bam
+#   ./submit SingleCheck -w 10000000 sample.bam          # -t defaults to --cpus
+#   ./submit --cpus 32 --mem 128G SingleCheck sample.bam # more cores = faster
+#   ./submit --gres gpu:a100:1 --partition gpu SingleCheck -G -r ref.fa r_1.fastq.gz r_2.fastq.gz
 #   ./submit --cpus 16 --mem 120G SingleCheck -r ref.fa s_1.fastq.gz s_2.fastq.gz
 #   ./submit --array 1-96 analysis/SingleCheckArray -w 1000000 Samples.txt .dedup
 #   ./submit --gres gpu:a100:2 --partition gpu SingleCheck -r ref.fa r_1.fastq.gz r_2.fastq.gz
@@ -87,7 +89,12 @@ BASENAME="$(basename "$TARGET")"
 
 # ---- per-script default resources (captured from the old #SBATCH headers) ---
 case "$BASENAME" in
-  SingleCheck|SingleCheckArray)   D_CPUS=3; D_TIME=10:00:00; D_MEM=60G  ;;
+  # SingleCheck now takes its thread count from $SLURM_CPUS_PER_TASK, so asking
+  # for more cores actually speeds it up (item 5.1 of HPC_OPTIMIZATION.md).
+  # Memory feeds `sort -S` and the `samtools sort -m` sizing on the FASTQ path.
+  SingleCheck)                    D_CPUS=8; D_TIME=10:00:00; D_MEM=64G  ;;
+  SingleCheckArray)               D_CPUS=3; D_TIME=10:00:00; D_MEM=60G  ;;
+  bench_stages.sh)                D_CPUS=8; D_TIME=12:00:00; D_MEM=64G  ;;
   DownsampleSam.sh)               D_CPUS=1; D_TIME=10:00:00; D_MEM=100G ;;
   SortSam.sh)                     D_CPUS=1; D_TIME=12:00:00; D_MEM=40G  ;;
   SimulateSingleCellReads.sh)     D_CPUS=1; D_TIME=20:00:00; D_MEM=20G  ;;

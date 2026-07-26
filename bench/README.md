@@ -62,7 +62,8 @@ Pipeline options mirror `SingleCheck`'s flags with long names: `--threads`, `--w
 | Downsampling | `index_ds` | `samtools index` | no |
 | Coverage | `mosdepth` | `mosdepth --fast-mode --by WSIZE` | no |
 | Autocorrelation | `shift_track` | `zcat \| awk` shift `\| pigz/bgzip/gzip` | no |
-| Autocorrelation | `unionbedg` | `bedtools unionbedg \| grep \| sort --version-sort \| awk` | no |
+| Autocorrelation | `unionbedg_sort` | **legacy**: `unionbedg \| grep \| sort --version-sort \| awk` | no |
+| Autocorrelation | `unionbedg_hash` | `unionbedg \| grep \| awk` hash accumulator, no external sort | no |
 | Gini/CV | `freq_table` | `zcat \| grep \| awk \| sort \| uniq -c` | no |
 | Gini/CV | `gini_R` | `Rscript src/GiniIndex.R` | no |
 | Gini/CV | `cv_R` | `Rscript src/CoefficientOfVariation.R` | no |
@@ -71,8 +72,10 @@ Pipeline options mirror `SingleCheck`'s flags with long names: `--threads`, `--w
 | MAD | `mad_R` | `Rscript src/MAD.R` | no |
 | Contamination | `unmapped_fasta` | `samtools view -f 0x4 \| awk` | **yes** |
 | Contamination | `metaphyler` | `metaphyler.pl` | no |
-| Final stats | `primary_bam` | `samtools view -bF 2304` + `samtools index` | no |
-| Final stats | `final_stats` | `samtools idxstats` ×3 + `awk` (breadth, MT %, unmapped %) | no |
+| Final stats | `primary_bam_legacy` | **legacy**: `samtools view -bF 2304` copy + `samtools index` | no |
+| Final stats | `idxstats_legacy` | **legacy**: `samtools idxstats` ×3 + `awk` | no |
+| Final stats | `mapstats` | one streaming pass (MT %, unmapped %) | no |
+| Final stats | `final_stats` | assemble the result line | no |
 
 The chunks marked **yes** are the ones whose cost grows with the input size; everything from
 `mosdepth` onwards works on the small downsampled BAM. That is the split
@@ -107,6 +110,22 @@ should still produce a useful report. Pass `--strict` to abort like `SingleCheck
 > The check is a copy of the pipeline's, not a shared library: **if you change one, change the
 > other**. Say the word and I'll factor it into a single `src/check_dependencies.sh` that both
 > source.
+
+### Optimized vs legacy
+
+Two steps were rewritten for [../HPC_OPTIMIZATION.md](../HPC_OPTIMIZATION.md) (see
+[../OPTIMIZATION_REPORT.md](../OPTIMIZATION_REPORT.md)). The benchmark runs **both** forms by
+default, so you get the speedup *and* the proof they agree, measured on your own data:
+
+| optimized chunk | legacy chunk(s) it replaces |
+|---|---|
+| `unionbedg_hash` (no external sort) | `unionbedg_sort` |
+| `mapstats` (one streaming pass) | `primary_bam_legacy` + `idxstats_legacy` |
+
+`report.md` gets an *Optimized vs legacy: do they agree?* table — the shifted-coverage tables are
+diffed row by row (after sorting, since the hash version is unordered) and the mapping
+percentages are compared to a relative tolerance of 1e-9. `--no-compare` skips the legacy
+variants once you trust them.
 
 ### How it works / what to watch out for
 

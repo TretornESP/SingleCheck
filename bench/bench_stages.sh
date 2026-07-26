@@ -28,6 +28,10 @@
 #       --strict         abort when the dependency check finds a problem, exactly
 #                        like ../SingleCheck. Default: report it and measure the
 #                        chunks that CAN run, skipping the rest.
+#       --no-compare     do not run the LEGACY variants of the optimized chunks.
+#                        By default the benchmark runs both the old and the new
+#                        implementation of the two rewritten steps, times them
+#                        side by side AND verifies they produce the same numbers.
 #       --env  FILE      per-cluster environment file to source (see
 #                        ../singlecheck_env.sh); defaults to $SINGLECHECK_ENV
 #       --keep           keep every intermediate artifact (default)
@@ -91,9 +95,20 @@ stage_align() {
     $ALIGNER \
         -t $THREADS $REFERENCE \
         $FASTQ1 $FASTQ2 | \
-        samtools sort -@$THREADS \
+        samtools sort -@$THREADS -m $SORTMEM -T "${SCRATCH}/sort.$$" \
         -o ${NAME}.bam -
     samtools index -@ $THREADS ${NAME}.bam
+}
+
+# GPU alternative to the chunk above (item 8.1). Skipped when pbrun is absent.
+stage_align_gpu() {
+    pbrun fq2bam \
+        --ref "$REFERENCE" \
+        --in-fq $FASTQ1 $FASTQ2 \
+        --out-bam ${NAME}.gpu.bam \
+        --tmp-dir "$SCRATCH" \
+        ${SLURM_GPUS:+--num-gpus $SLURM_GPUS}
+    samtools index -@ $THREADS ${NAME}.gpu.bam
 }
 
 # --- raw sequencing depth ----------------------------------------------------
@@ -163,7 +178,7 @@ stage_index_ds() {
 stage_mosdepth() {
     precision=$(echo $WSIZE | wc -c | awk '{print $1-2}')
     MOSDEPTH_PRECISION=${precision} "$MOSDEPTH" \
-        -t $THREADS \
+        -t $MD_THREADS \
         --fast-mode \
         --by $WSIZE \
         --flag $FLAGTOFILTEROUT \
@@ -182,7 +197,9 @@ stage_shift_track() {
     $GZIP_CMD > ${NAME}.${WSIZE}.${DELTA}.bed.gz
 }
 
-stage_unionbedg() {
+# LEGACY autocorrelation aggregation: whole-genome external sort + RLE.
+# Kept so the benchmark can measure -- and validate -- what replaced it.
+stage_unionbedg_sort() {
     "$BEDTOOLS" unionbedg -filler NA  \
     -i ${NAME}.${WSIZE}.per-base.bed.gz \
     ${NAME}.${WSIZE}.${DELTA}.bed.gz | \
@@ -193,7 +210,23 @@ stage_unionbedg() {
     else if (value1!=$4 || value2!=$5){print value1"\t"value2"\t"diff; diff=$3-$2;value1=$4;value2=$5}
     else{diff=diff+($3-$2);value1=$4;value2=$5}
     }END{print value1"\t"value2"\t"diff}' \
-    > ${NAME}.${DELTA}.shiftedcov.txt
+    > ${NAME}.${DELTA}.shiftedcov.legacy.txt
+    # the pipeline's canonical artifact, for the chunks that come after
+    cp ${NAME}.${DELTA}.shiftedcov.legacy.txt ${NAME}.${DELTA}.shiftedcov.txt
+}
+
+# CURRENT autocorrelation aggregation: hash accumulator, no external sort.
+# Writes to a separate file so the runner can prove the two agree.
+stage_unionbedg_hash() {
+    "$BEDTOOLS" unionbedg -filler NA  \
+    -i ${NAME}.${WSIZE}.per-base.bed.gz \
+    ${NAME}.${WSIZE}.${DELTA}.bed.gz | \
+    grep -E "$DIPLOID_REGEX" | \
+    awk '{pair[$4"\t"$5] += $3-$2}
+         END{for (p in pair) print p"\t"pair[p]}' \
+    > ${NAME}.${DELTA}.shiftedcov.fast.txt
+    # the pipeline's canonical artifact, for the chunks that come after
+    cp ${NAME}.${DELTA}.shiftedcov.fast.txt ${NAME}.${DELTA}.shiftedcov.txt
 }
 
 # --- gini / cv input + R -----------------------------------------------------
@@ -253,16 +286,36 @@ stage_metaphyler() {
 }
 
 # --- final statistics --------------------------------------------------------
-stage_primary_bam() {
+# LEGACY: write a primary-only copy of the analysis BAM, index it, then read it
+# back three times with idxstats. Kept for comparison.
+stage_primary_bam_legacy() {
     samtools view -bF 2304 -@ $THREADS ${NAME}.${downsampling_depth}X.bam > ${NAME}.${downsampling_depth}X.primary.bam
     samtools index -@ $THREADS ${NAME}.${downsampling_depth}X.primary.bam
 }
 
-stage_final_stats() {
+stage_idxstats_legacy() {
     MT_mappedreads=$(samtools idxstats ${NAME}.${downsampling_depth}X.primary.bam | grep -E "$MT_REGEX" | awk '{print $3}')
-    mt_perc_totalreads=$(samtools idxstats ${NAME}.${downsampling_depth}X.primary.bam | awk -v mt=$MT_mappedreads '{sum+=($3+$4)}END{print mt/sum*100}')
-    unmapped_perc_totalreads=$(samtools idxstats ${NAME}.${downsampling_depth}X.primary.bam | \
+    mt=$(samtools idxstats ${NAME}.${downsampling_depth}X.primary.bam | awk -v mt=$MT_mappedreads '{sum+=($3+$4)}END{print mt/sum*100}')
+    un=$(samtools idxstats ${NAME}.${downsampling_depth}X.primary.bam | \
         awk '{mapped+=$3;unmapped+=$4}END{print unmapped/(unmapped+mapped)*100}')
+    printf "%s %s\n" "$mt" "$un" > ${NAME}.mapstats.legacy.txt
+    cat ${NAME}.mapstats.legacy.txt
+}
+
+# CURRENT: one streaming pass, no copy, no index, no idxstats.
+stage_mapstats() {
+    samtools view -F 2304 -@ $THREADS $SAMREF ${NAME}.${downsampling_depth}X.bam | \
+    awk -v mtre="$MT_REGEX" '
+        { total++
+          if (int($2/4)%2 == 1) { unmapped++ }
+          else if ($3 ~ mtre)   { mt++ } }
+        END{ if (total>0) printf "%s %s\n", mt/total*100, unmapped/total*100
+             else printf "NA NA\n" }' > ${NAME}.mapstats.txt
+    cat ${NAME}.mapstats.txt
+}
+
+stage_final_stats() {
+    read mt_perc_totalreads unmapped_perc_totalreads < ${NAME}.mapstats.txt
     breadth=$(awk '{if ($1==0){sum+=$3}else if ($1!="NA"){rest+=$3}}END{print 100 - ((sum/(rest+sum))*100)}' ${NAME}.${DELTA}.shiftedcov.txt)
     if [ -s ${NAME}.genus.tab ]; then
         class=$(awk '{if ($1 !~ "{") print $0}' ${NAME}.genus.tab | grep -v "^@" | awk '{print $1"-"$2"-"$3"-"$4"-"$5}' | tr -s '\n' ',' | sed 's/,$/\n/')
@@ -302,7 +355,7 @@ set -uo pipefail
 #                        3. OPTIONS                                           #
 ###############################################################################
 INPUT="" ; INPUT2="" ; REPS=3 ; OUTDIR="" ; STAGES_CSV="" ; LIST=0
-WARMUP=0 ; FULL=0 ; CLEAN=0 ; STRICT=0 ; ENVFILE="${SINGLECHECK_ENV:-}"
+WARMUP=0 ; FULL=0 ; CLEAN=0 ; STRICT=0 ; COMPARE=1 ; ENVFILE="${SINGLECHECK_ENV:-}"
 
 # pipeline defaults -- kept identical to ../SingleCheck
 WSIZE=10000000
@@ -328,6 +381,7 @@ while [ "$#" -gt 0 ]; do
     --warmup)        WARMUP=1; shift ;;
     --full)          FULL=1; shift ;;
     --strict)        STRICT=1; shift ;;
+    --no-compare)    COMPARE=0; shift ;;
     --env)           ENVFILE="$2"; shift 2 ;;
     --keep)          CLEAN=0; shift ;;
     --clean)         CLEAN=1; shift ;;
@@ -352,6 +406,7 @@ if [ "$LIST" -eq 1 ]; then
 Chunks, in pipeline order (key -- what it runs):
 
   align            bwa-mem2/bwa mem | samtools sort ; samtools index   [FASTQ input only]
+  align_gpu        pbrun fq2bam (NVIDIA Parabricks)                    [FASTQ + GPU only]
   genome_length    samtools view -H | grep @SQ | awk
   count_reads      samtools view -c -F 2304                            [full input file]
   mean_readlen     samtools view | head -1000000 | cut | sort | uniq   [full input file]
@@ -360,7 +415,8 @@ Chunks, in pipeline order (key -- what it runs):
   index_ds         samtools index (downsampled BAM)
   mosdepth         mosdepth --fast-mode --by WSIZE
   shift_track      zcat per-base | awk shift | pigz/bgzip/gzip
-  unionbedg        bedtools unionbedg | grep | sort --version-sort | awk
+  unionbedg_sort   LEGACY: unionbedg | grep | sort --version-sort | awk RLE
+  unionbedg_hash   unionbedg | grep | awk hash accumulator (no external sort)
   freq_table       zcat regions | grep | awk | sort | uniq -c | awk
   gini_R           Rscript src/GiniIndex.R
   cv_R             Rscript src/CoefficientOfVariation.R
@@ -369,8 +425,10 @@ Chunks, in pipeline order (key -- what it runs):
   mad_R            Rscript src/MAD.R
   unmapped_fasta   samtools view -f 0x4 | awk                          [full input file]
   metaphyler       metaphyler.pl (contamination)
-  primary_bam      samtools view -bF 2304 + samtools index
-  final_stats      samtools idxstats x3 + awk (breadth, MT%, unmapped%)
+  primary_bam_legacy  LEGACY: samtools view -bF 2304 copy + samtools index
+  idxstats_legacy     LEGACY: samtools idxstats x3 + awk
+  mapstats            one streaming pass over the analysis BAM (MT%, unmapped%)
+  final_stats         assemble the result line (breadth + the metric files)
 EOF
   exit 0
 fi
@@ -456,6 +514,19 @@ else SORTCOMP=gzip; fi
 if command -v pigz >/dev/null 2>&1; then GZIP_CMD="pigz -c -p $THREADS"
 elif command -v bgzip >/dev/null 2>&1; then GZIP_CMD="bgzip -@ $THREADS -c"
 else GZIP_CMD="gzip -c"; fi
+
+# Same thread split and sort sizing as ../SingleCheck (items 5.1, 6.6, 11).
+MD_THREADS=$THREADS
+[ "$MD_THREADS" -gt 4 ] && MD_THREADS=4
+
+sort_mem_mb=0
+if [ -n "${SLURM_MEM_PER_NODE:-}" ]; then
+    sort_mem_mb=$(( ${SLURM_MEM_PER_NODE%%[!0-9]*} * 70 / 100 / THREADS ))
+elif [ -n "${SLURM_MEM_PER_CPU:-}" ]; then
+    sort_mem_mb=$(( ${SLURM_MEM_PER_CPU%%[!0-9]*} * 70 / 100 ))
+fi
+[ "$sort_mem_mb" -lt 256 ] && sort_mem_mb=768
+SORTMEM="${sort_mem_mb}M"
 
 SAMREF=""
 [ -n "$REFERENCE" ] && SAMREF="--reference $REFERENCE"
@@ -862,8 +933,10 @@ add_stage() { # key group desc needs_cmd needs_file reset
 }
 
 if [ "$METHOD" != "Aligned" ]; then
-  add_stage align "Alignment" "bwa mem | samtools sort ; samtools index" \
+  add_stage align "Alignment" "bwa mem | samtools sort -m $SORTMEM ; samtools index" \
     "samtools" "$FASTQ1" "${NAME}.bam ${NAME}.bam.bai"
+  add_stage align_gpu "Alignment" "GPU: pbrun fq2bam (Parabricks)" \
+    "pbrun" "$FASTQ1" "${NAME}.gpu.bam ${NAME}.gpu.bam.bai"
 fi
 
 add_stage genome_length "Raw depth" "samtools view -H | awk (genome length)" \
@@ -883,9 +956,14 @@ add_stage mosdepth "Coverage" "mosdepth --fast-mode --by $WSIZE" \
   "${NAME}.${WSIZE}.per-base.bed.gz ${NAME}.${WSIZE}.per-base.bed.gz.csi ${NAME}.${WSIZE}.regions.bed.gz ${NAME}.${WSIZE}.regions.bed.gz.csi"
 add_stage shift_track "Autocorrelation" "zcat per-base | awk shift | gzip" \
   "zcat" "${NAME}.${WSIZE}.per-base.bed.gz" "${NAME}.${WSIZE}.${DELTA}.bed.gz"
-add_stage unionbedg "Autocorrelation" "bedtools unionbedg | grep | sort | awk" \
+if [ "$COMPARE" -eq 1 ]; then
+  add_stage unionbedg_sort "Autocorrelation" "LEGACY: unionbedg | grep | sort --version-sort | awk RLE" \
+    "$BEDTOOLS" "${NAME}.${WSIZE}.per-base.bed.gz ${NAME}.${WSIZE}.${DELTA}.bed.gz" \
+    "${NAME}.${DELTA}.shiftedcov.legacy.txt ${NAME}.${DELTA}.shiftedcov.txt"
+fi
+add_stage unionbedg_hash "Autocorrelation" "bedtools unionbedg | grep | awk hash (sort-free)" \
   "$BEDTOOLS" "${NAME}.${WSIZE}.per-base.bed.gz ${NAME}.${WSIZE}.${DELTA}.bed.gz" \
-  "${NAME}.${DELTA}.shiftedcov.txt"
+  "${NAME}.${DELTA}.shiftedcov.fast.txt ${NAME}.${DELTA}.shiftedcov.txt"
 add_stage freq_table "Gini/CV" "zcat regions | sort | uniq -c (freq table)" \
   "zcat" "${NAME}.${WSIZE}.regions.bed.gz" "${NAME}.${WSIZE}.freqs.txt"
 add_stage gini_R "Gini/CV" "Rscript GiniIndex.R" \
@@ -902,10 +980,16 @@ add_stage unmapped_fasta "Contamination" "samtools view -f 0x4 | awk (full file)
   "samtools" "$ALN" "${NAME}.unmapped.fasta"
 add_stage metaphyler "Contamination" "metaphyler.pl" \
   "$METAPHYLER" "${NAME}.unmapped.fasta" ""
-add_stage primary_bam "Final stats" "samtools view -bF 2304 + index" \
-  "samtools" "${DS}.bam" "${DS}.primary.bam ${DS}.primary.bam.bai"
-add_stage final_stats "Final stats" "samtools idxstats x3 + awk" \
-  "samtools" "${DS}.primary.bam ${NAME}.${DELTA}.shiftedcov.txt" "${NAME}.SingleCheck.txt"
+if [ "$COMPARE" -eq 1 ]; then
+  add_stage primary_bam_legacy "Final stats" "LEGACY: samtools view -bF 2304 copy + index" \
+    "samtools" "${DS}.bam" "${DS}.primary.bam ${DS}.primary.bam.bai"
+  add_stage idxstats_legacy "Final stats" "LEGACY: samtools idxstats x3 + awk" \
+    "samtools" "${DS}.primary.bam" "${NAME}.mapstats.legacy.txt"
+fi
+add_stage mapstats "Final stats" "one streaming pass (MT %, unmapped %)" \
+  "samtools" "${DS}.bam" "${NAME}.mapstats.txt"
+add_stage final_stats "Final stats" "assemble the result line" \
+  "samtools" "${NAME}.mapstats.txt ${NAME}.${DELTA}.shiftedcov.txt" "${NAME}.SingleCheck.txt"
 
 # restrict to --stages
 declare -a RUN_KEYS=()
@@ -1020,6 +1104,48 @@ for key in "${RUN_KEYS[@]}"; do
   if [ -s "$BENCH_VALS" ]; then source "$BENCH_VALS"; save_state; fi
 done
 
+###############################################################################
+#        7b. EQUIVALENCE OF THE OPTIMIZED CHUNKS vs THEIR LEGACY FORM         #
+#                                                                             #
+# Timing an optimization is only half the job: the report must also say the   #
+# rewritten step still produces the same numbers, ON THIS DATA.               #
+###############################################################################
+EQUIV_LINES=()
+if [ "$COMPARE" -eq 1 ]; then
+  echo
+  echo "  verifying the optimized chunks against the legacy ones"
+
+  # autocorrelation input: same set of (depth, shifted depth, length) rows.
+  # Row ORDER differs by construction (a hash has no order), so sort both.
+  legacy="${NAME}.${DELTA}.shiftedcov.legacy.txt"
+  fast="${NAME}.${DELTA}.shiftedcov.fast.txt"
+  if [ -s "$legacy" ] && [ -s "$fast" ]; then
+    if diff -q <(sort "$legacy") <(sort "$fast") >/dev/null 2>&1; then
+      EQUIV_LINES+=("| \`unionbedg_hash\` vs \`unionbedg_sort\` | **identical** | $(wc -l < "$fast") rows |")
+      echo "      shiftedcov: IDENTICAL"
+    else
+      nd=$(diff <(sort "$legacy") <(sort "$fast") | grep -c '^[<>]')
+      EQUIV_LINES+=("| \`unionbedg_hash\` vs \`unionbedg_sort\` | **DIFFERS** | $nd differing rows -- see work/ |")
+      echo "      shiftedcov: DIFFERS ($nd rows)" >&2
+    fi
+  fi
+
+  # mapping statistics: two floats, compare with a relative tolerance
+  if [ -s "${NAME}.mapstats.txt" ] && [ -s "${NAME}.mapstats.legacy.txt" ]; then
+    if awk 'NR==FNR{a1=$1;a2=$2;next}
+            {d1=(a1-$1); if(d1<0)d1=-d1; d2=(a2-$2); if(d2<0)d2=-d2
+             r1=(a1>0?d1/a1:d1); r2=(a2>0?d2/a2:d2)
+             exit (r1<1e-9 && r2<1e-9) ? 0 : 1}' \
+           "${NAME}.mapstats.legacy.txt" "${NAME}.mapstats.txt"; then
+      EQUIV_LINES+=("| \`mapstats\` vs \`primary_bam_legacy\`+\`idxstats_legacy\` | **identical** | MT % and unmapped % agree to 1e-9 |")
+      echo "      mapstats:   IDENTICAL"
+    else
+      EQUIV_LINES+=("| \`mapstats\` vs \`primary_bam_legacy\`+\`idxstats_legacy\` | **DIFFERS** | legacy: $(cat "${NAME}.mapstats.legacy.txt"), new: $(cat "${NAME}.mapstats.txt") |")
+      echo "      mapstats:   DIFFERS" >&2
+    fi
+  fi
+fi
+
 # --- optional end-to-end reference run --------------------------------------
 if [ "$FULL" -eq 1 ]; then
   echo
@@ -1072,7 +1198,8 @@ fi
   echo "| input | \`$ABS_INPUT\` (${INPUT_SIZE:-?}, $METHOD) |"
   echo "| repetitions | $REPS $([ "$WARMUP" -eq 1 ] && echo '(+1 warmup, not measured)') |"
   echo "| dependency check | $missing problem(s), $warnings warning(s) |"
-  echo "| threads (-t) | $THREADS |"
+  echo "| threads (-t) | $THREADS (mosdepth capped at $MD_THREADS) |"
+  echo "| samtools sort memory | $SORTMEM per thread |"
   echo "| window (-w) | $WSIZE |"
   echo "| delta (-i) | $DELTA |"
   echo "| downsampling depth (-d) | $downsampling_depth |"
@@ -1211,6 +1338,18 @@ awk -F'\t' -v OFS='\t' '
 ' "$TIMINGS" >> "$REPORT"
 
 {
+  if [ "${#EQUIV_LINES[@]}" -gt 0 ]; then
+    echo "## Optimized vs legacy: do they agree?"
+    echo
+    echo "The chunks rewritten for HPC_OPTIMIZATION.md were run in BOTH forms on this input."
+    echo "Compare their rows in the timing table above for the speedup, and this table for"
+    echo "correctness:"
+    echo
+    echo "| comparison | verdict | detail |"
+    echo "|---|---|---|"
+    printf '%s\n' "${EQUIV_LINES[@]}"
+    echo
+  fi
   echo "## How to read this"
   echo
   echo "* Chunks are the command chains of \`../SingleCheck\`, executed in pipeline order in"

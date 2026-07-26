@@ -33,15 +33,28 @@
 			'NW_[0-9]*'
             -m <STRING> mitochondrial contig name if different from MT or chrM.
                 Quotes are not required in this case
-        
+            -G use GPU alignment (NVIDIA Parabricks 'pbrun fq2bam') when available.
+                FASTQ input only; ignored for BAM/CRAM input
+
 	Note: the bam file must be indexed and fastq files must be .gz compressed.
+
+	Environment variables (HPC tuning, see HPC_OPTIMIZATION.md / OPTIMIZATION_REPORT.md):
+	    SINGLECHECK_ENV            per-cluster module/tool definitions to source
+	    SINGLECHECK_SCRATCH=0      keep intermediates next to the output instead of
+	                               on node-local scratch (\$SLURM_TMPDIR)
+	    SINGLECHECK_LEGACY_AUTOCORR=1
+	                               use the old external-sort autocorrelation path
+	    SINGLECHECK_NO_OVERLAP=1   run the MetaPhyler branch serially, not in parallel
+	    SINGLECHECK_STRICT_MODULES=1
+	                               abort when a 'module load' fails
 	"
 
 	WSIZE=10000000
 	DELTA=1000
 	FLAGTOFILTEROUT=772
-	THREADS=3
+	THREADS=""            # resolved from -t, else \$SLURM_CPUS_PER_TASK, else 3
 	MAPQUAL=20
+	USE_GPU=0
 	DIPLOID_REGEX="^(chr)*[1-9]"
         MT_REGEX='^(MT|chrM)'
         DOWNSAMPLE="YES"
@@ -51,7 +64,7 @@
         isanum='^[0-9]+$'
 
         # The : before the flags is for taking control of flags that are not in the list
-	while getopts ':hw:i:f:t:q:XNd:s:c:m:r::' option; do
+	while getopts ':hw:i:f:t:q:XNGd:s:c:m:r::' option; do
 	  case "$option" in
 	    h) echo "$usage"
 	       exit
@@ -88,6 +101,8 @@
                ;;
             N) DOWNSAMPLE="NO"
 	       ;;
+            G) USE_GPU=1
+               ;;
             d) downsampling_depth=$OPTARG
                re='^[0-9]+([.][0-9]+)?$'
 	       if [[ ! $downsampling_depth =~ $re ]] ; then
@@ -124,7 +139,14 @@
 	done
 	shift $((OPTIND - 1))
 
-
+# Thread count: an explicit -t always wins. Otherwise take the cores SLURM
+# actually gave this job -- on a big node the old hard-coded 3 left most of the
+# allocation idle (item 4/5.1 of HPC_OPTIMIZATION.md).
+if [ -z "$THREADS" ]; then
+    THREADS="${SLURM_CPUS_PER_TASK:-3}"
+    case "$THREADS" in ''|*[!0-9]*) THREADS=3 ;; esac
+fi
+[ "$THREADS" -lt 1 ] && THREADS=1
 
 if [ "$#" -gt 2 ]; then
     printf "\nIncorrect number of arguments\n" >&2
@@ -294,6 +316,23 @@ if command -v pigz >/dev/null 2>&1; then GZIP_CMD="pigz -c -p $THREADS"
 elif command -v bgzip >/dev/null 2>&1; then GZIP_CMD="bgzip -@ $THREADS -c"
 else GZIP_CMD="gzip -c"; fi
 
+# mosdepth's BAM decompression stops scaling at ~4 threads (HPC_OPTIMIZATION.md
+# 5.1); handing it 32 only wastes cores that samtools/sort could be using.
+MD_THREADS=$THREADS
+[ "$MD_THREADS" -gt 4 ] && MD_THREADS=4
+
+# Per-thread memory for `samtools sort` on the FASTQ path. Default (768M/thread)
+# either wastes RAM or OOM-kills the job depending on -t; derive it from what
+# SLURM actually granted and keep a safety margin (item 11 of HPC_OPTIMIZATION.md).
+sort_mem_mb=0
+if [ -n "${SLURM_MEM_PER_NODE:-}" ]; then
+    sort_mem_mb=$(( ${SLURM_MEM_PER_NODE%%[!0-9]*} * 70 / 100 / THREADS ))
+elif [ -n "${SLURM_MEM_PER_CPU:-}" ]; then
+    sort_mem_mb=$(( ${SLURM_MEM_PER_CPU%%[!0-9]*} * 70 / 100 ))
+fi
+[ "$sort_mem_mb" -lt 256 ] && sort_mem_mb=768
+SORTMEM="${sort_mem_mb}M"
+
 # Reference argument for samtools when reading CRAM (harmless/ignored for BAM).
 SAMREF=""
 if [ -n "$REFERENCE" ]; then SAMREF="--reference $REFERENCE"; fi
@@ -318,6 +357,37 @@ fi
 
 # Metaphyler location (override with the $METAPHYLER environment variable).
 METAPHYLER="${METAPHYLER:-$HOME/apps/Metaphyler/MetaPhylerSRV0.115/metaphyler.pl}"
+
+############################################################################
+#                   WORK PREFIX -- KEEP INTERMEDIATES OFF LUSTRE           #
+############################################################################
+# Item 6.1/6.4 of HPC_OPTIMIZATION.md: every intermediate (downsampled BAM,
+# per-base track, shifted track, RLE tables, unmapped FASTA, MetaPhyler
+# output, the four per-metric files) is written to node-local scratch and
+# only the tiny ${NAME}.SingleCheck.txt lands on the shared filesystem.
+# Everything downstream uses $WORKPFX instead of $NAME.
+SAMPLE=$(basename "$NAME")
+WORKDIR=$(dirname "$NAME")
+WORKPFX="$NAME"                 # fallback: work where the output goes
+SCRATCHWORK=""
+
+if [ "${SINGLECHECK_SCRATCH:-1}" != "0" ] && [ -d "$SCRATCH" ] && [ -w "$SCRATCH" ]; then
+    # Only use scratch when it plausibly fits the per-base track + downsampled
+    # BAM; a full node-local disk mid-run is worse than slow Lustre writes.
+    free_scratch_kb=$(df -Pk "$SCRATCH" 2>/dev/null | awk 'NR==2{print $4}')
+    case "$free_scratch_kb" in ''|*[!0-9]*) free_scratch_kb=0 ;; esac
+    if [ "$free_scratch_kb" -ge 20000000 ]; then     # >= ~20 GB
+        SCRATCHWORK="${SCRATCH}/singlecheck.${SAMPLE}.${SLURM_JOB_ID:-$$}"
+        mkdir -p "$SCRATCHWORK" && WORKPFX="${SCRATCHWORK}/${SAMPLE}" || SCRATCHWORK=""
+    fi
+fi
+RESDIR=$(dirname "$WORKPFX")
+
+# Never leave a multi-GB working set behind on a compute node.
+cleanup_scratch() {
+    [ -n "$SCRATCHWORK" ] && [ -d "$SCRATCHWORK" ] && rm -rf "$SCRATCHWORK"
+}
+trap cleanup_scratch EXIT INT TERM
 
 ############################################################################
 #                        CHECK DEPENDENCIES                                #
@@ -592,6 +662,21 @@ if [ "$METHOD" == "Paired-end" ] || [ "$METHOD" == "Single-end" ]; then
     fi
 fi
 
+# --- optional GPU alignment (NVIDIA Parabricks, item 8.1) --------------------
+if [ "$USE_GPU" -eq 1 ]; then
+    if [ "$METHOD" == "Aligned" ]; then
+        warn "-G ignored: GPU alignment only applies to FASTQ input"
+        USE_GPU=0
+    elif ! have pbrun; then
+        err "-G requested but 'pbrun' (NVIDIA Parabricks) is not on \$PATH -- module load parabricks, or drop -G"
+    else
+        if [ -z "${SLURM_GPUS:-}${SLURM_JOB_GPUS:-}${CUDA_VISIBLE_DEVICES:-}" ]; then
+            warn "-G requested but no GPU seems to be allocated (sbatch --gres=gpu:N) -- pbrun will likely fail"
+        fi
+        found "GPU aligner pbrun ($(resolve pbrun))"
+    fi
+fi
+
 # --- reference genome --------------------------------------------------------
 if [ -n "$REFERENCE" ]; then
     if [ ! -f "$REFERENCE" ]; then
@@ -681,6 +766,29 @@ fi
 [ "$warnings" -ne 0 ] && printf "  %d warning(s) -- continuing\n" "$warnings"
 echo "  all dependencies OK"
 
+# --- effective HPC settings (goes into the SLURM log for every run) ----------
+echo "> HPC settings"
+printf "  threads            : %s (samtools/sort/aligner), %s (mosdepth)\n" "$THREADS" "$MD_THREADS"
+printf "  samtools sort mem  : %s per thread\n" "$SORTMEM"
+printf "  scratch (\$TMPDIR)  : %s\n" "$SCRATCH"
+if [ -n "$SCRATCHWORK" ]; then
+    printf "  intermediates      : %s (node-local; only the result goes to %s)\n" "$SCRATCHWORK" "$WORKDIR"
+else
+    printf "  intermediates      : %s (shared filesystem -- set a bigger \$SLURM_TMPDIR to speed this up)\n" "$WORKDIR"
+fi
+printf "  track compressor   : %s   sort spill: %s\n" "$GZIP_CMD" "$SORTCOMP"
+if [ "${SINGLECHECK_LEGACY_AUTOCORR:-0}" = "1" ]; then
+    printf "  autocorrelation    : legacy external sort\n"
+else
+    printf "  autocorrelation    : sort-free streaming aggregation\n"
+fi
+if [ "${SINGLECHECK_NO_OVERLAP:-0}" = "1" ]; then
+    printf "  MetaPhyler branch  : serial\n"
+else
+    printf "  MetaPhyler branch  : overlapped with the coverage branch\n"
+fi
+[ "$USE_GPU" -eq 1 ] && printf "  alignment          : GPU (pbrun fq2bam)\n"
+
 # ///////// CONDA ENVIRONMENTS MISSING, CREATE A SINGLE ONE
 
 ############################################################################
@@ -688,15 +796,29 @@ echo "  all dependencies OK"
 ############################################################################
 
 if [ "$METHOD" == "Paired-end" ] || [ "$METHOD" == "Single-end" ]; then
+    if [ "$USE_GPU" -eq 1 ]; then
+        # GPU path (item 8.1): Parabricks fq2bam does BWA-MEM + coordinate sort
+        # on the GPU and emits a standard BAM the rest of the pipeline reads.
+        echo "> Aligning on GPU (pbrun fq2bam)"
+        pbrun fq2bam \
+            --ref "$REFERENCE" \
+            --in-fq $FASTQ1 $FASTQ2 \
+            --out-bam ${NAME}.bam \
+            --tmp-dir "$SCRATCH" \
+            ${SLURM_GPUS:+--num-gpus $SLURM_GPUS}
+    else
 	# The reference, its .fai and the aligner index were all verified in
 	# CHECK DEPENDENCIES, which also picked $ALIGNER (bwa-mem2 when its index
 	# is present -- ~1.3-1.8x faster -- otherwise classic bwa).
+	# -m sizes the sort buffer to the allocation and -T keeps the spill on
+	# node-local scratch instead of the shared filesystem (items 6.1/6.6).
 	$ALIGNER \
 		-t $THREADS $REFERENCE \
 		$FASTQ1 $FASTQ2 | \
-		samtools sort -@$THREADS \
+		samtools sort -@$THREADS -m $SORTMEM -T "${SCRATCH}/sort.$$" \
 		-o ${NAME}.bam -
-        samtools index -@ $THREADS ${NAME}.bam
+    fi
+    samtools index -@ $THREADS ${NAME}.bam
 fi
 
 ############################################################################
@@ -755,11 +877,11 @@ then
 	# Target depth >= actual (or -N): analyse the full file. The analysis handle is
 	# always a BAM; symlink when the input is already BAM, else materialise one.
 	if [[ "$ALN" == *.bam ]]; then
-		ln -sf "$(readlink -f ${ALN})" ${NAME}.${downsampling_depth}X.bam
+		ln -sf "$(readlink -f ${ALN})" ${WORKPFX}.${downsampling_depth}X.bam
 	else
-		samtools view -b -@ $THREADS $SAMREF ${ALN} -o ${NAME}.${downsampling_depth}X.bam
+		samtools view -b -@ $THREADS $SAMREF ${ALN} -o ${WORKPFX}.${downsampling_depth}X.bam
 	fi
-	samtools index -@ $THREADS ${NAME}.${downsampling_depth}X.bam
+	samtools index -@ $THREADS ${WORKPFX}.${downsampling_depth}X.bam
         DEPTH=$sequencing_depth
 else
 	# Replace single-threaded Picard DownsampleSam with multithreaded, streaming
@@ -769,9 +891,39 @@ else
 	frac="${probability#0}"          # bc may emit ".0123" or "0.0123" -> ".0123"
 	subsample_arg="1${frac}"         # -> "1.0123" (seed.fraction)
 	echo "Downsampling with samtools view -s. From "${sequencing_depth}"X to "${downsampling_depth}"X. Fraction kept: "$probability
-	samtools view -b -@ $THREADS $SAMREF -s ${subsample_arg} ${ALN} -o ${NAME}.${downsampling_depth}X.bam
-	samtools index -@ $THREADS ${NAME}.${downsampling_depth}X.bam
+	samtools view -b -@ $THREADS $SAMREF -s ${subsample_arg} ${ALN} -o ${WORKPFX}.${downsampling_depth}X.bam
+	samtools index -@ $THREADS ${WORKPFX}.${downsampling_depth}X.bam
         DEPTH=$downsampling_depth
+fi
+
+############################################################################
+#          METAPHYLER BRANCH -- OVERLAPPED WITH THE COVERAGE BRANCH        #
+############################################################################
+# Item 5.3 of HPC_OPTIMIZATION.md. The unmapped-read scan is a second full
+# pass over the original (multi-TB) file and feeds only the last output
+# column, so it is completely independent of the mosdepth/metrics branch.
+# Start it now in the background: its I/O overlaps the coverage work instead
+# of adding to it. `wait` before the final table is assembled.
+MP_PID=""
+# Split the cores: mosdepth saturates at $MD_THREADS, so the rest can decode
+# the unmapped scan without either branch starving the other.
+MP_THREADS=$(( THREADS - MD_THREADS ))
+[ "$MP_THREADS" -lt 1 ] && MP_THREADS=1
+metaphyler_branch() {
+    samtools view -f 0x4 -@ $MP_THREADS $SAMREF ${ALN} | awk '{OFS="\t"; print ">"$1"\n"$10}' > ${WORKPFX}.unmapped.fasta
+    if ! "$METAPHYLER" 2 ${WORKPFX}.unmapped.fasta ${WORKPFX} || [ ! -s ${WORKPFX}.genus.tab ]; then
+        printf "\nWarning: MetaPhyler did not produce %s.genus.tab -- the contaminants\n" "${WORKPFX}" >&2
+        printf "         column will be NA. Every other metric is unaffected.\n" >&2
+        printf "         Check the installation at %s\n" "$METAPHYLER" >&2
+    fi
+}
+if [ "${SINGLECHECK_NO_OVERLAP:-0}" = "1" ]; then
+    echo "> METAPHYLER (serial)"
+    metaphyler_branch
+else
+    echo "> METAPHYLER (started in the background, overlapped with the coverage branch)"
+    metaphyler_branch > ${WORKPFX}.metaphyler.log 2>&1 &
+    MP_PID=$!
 fi
 
 echo "> Running mosdepth"
@@ -782,54 +934,75 @@ echo "> Running mosdepth"
         # --fast-mode dont look at internal cigar operations or correct mate overlaps (recommended for most use-cases). Avoids the extra calculations of mate pair overlap and cigar operations
         # 772 flag: exclude read unmapped, not primary alignment, read fails platform/vendor quality checks
         MOSDEPTH_PRECISION=${precision} "$MOSDEPTH" \
-                -t $THREADS \
+                -t $MD_THREADS \
                 --fast-mode \
                 --by $WSIZE \
                 --flag $FLAGTOFILTEROUT \
                 --mapq $MAPQUAL \
-                ${NAME}.${WSIZE} \
-                ${NAME}.${downsampling_depth}X.bam
+                ${WORKPFX}.${WSIZE} \
+                ${WORKPFX}.${downsampling_depth}X.bam
         # Output .regions.bed.gz contains mean base depth per window
-	rm ${NAME}.${WSIZE}.mosdepth* # remove extra files created by mosdepth
+	rm ${WORKPFX}.${WSIZE}.mosdepth* # remove extra files created by mosdepth
 
 # Only meaningful when mosdepth came from the conda env activated above.
 command -v conda >/dev/null 2>&1 && conda deactivate
 
 echo "> Creating input for autocorrelation"
-        zcat ${NAME}.${WSIZE}.per-base.bed.gz | \
+        zcat ${WORKPFX}.${WSIZE}.per-base.bed.gz | \
         awk -v alpha=$DELTA -v print_switch=0 \
         '{if (print_switch==1) {start=$2-alpha; if (start<0) {print $1"\t"0"\t"$3-alpha"\t"$4} else{print $1"\t"start"\t"$3-alpha"\t"$4}}
         else if (alpha >= $2 && alpha < $3) {start=$2-alpha;if (start<0) {print $1"\t"0"\t"$3-alpha"\t"$4} else {print $1"\t"start"\t"$3-alpha"\t"$4}; print_switch=1}}' | \
-        $GZIP_CMD > ${NAME}.${WSIZE}.${DELTA}.bed.gz
+        $GZIP_CMD > ${WORKPFX}.${WSIZE}.${DELTA}.bed.gz
 
-        "$BEDTOOLS" unionbedg -filler NA  \
-        -i ${NAME}.${WSIZE}.per-base.bed.gz \
-        ${NAME}.${WSIZE}.${DELTA}.bed.gz | \
-        grep -E "$DIPLOID_REGEX" | \
-        sort --parallel=$THREADS -S 80% --compress-program=$SORTCOMP -T "$SCRATCH" --version-sort -k4 -k5 | \
-        awk  \
-        '{if (FNR==1){diff=$3-$2;value1=$4;value2=$5}
-        else if (value1!=$4 || value2!=$5){print value1"\t"value2"\t"diff; diff=$3-$2;value1=$4;value2=$5}
-        else{diff=diff+($3-$2);value1=$4;value2=$5}
-        }END{print value1"\t"value2"\t"diff}' \
-        > ${NAME}.${DELTA}.shiftedcov.txt
+        # The union of the two tracks is grouped by the (depth, shifted depth)
+        # pair. The old code did that by sorting the WHOLE per-base genome track
+        # (`sort --version-sort -k4 -k5`, tens of GB spilling to disk) and then
+        # run-length-encoding adjacent rows. Grouping is associative, so a hash
+        # accumulator in a single streaming pass produces exactly the same set of
+        # (v1, v2, total_length) rows -- only the row order differs, and every
+        # consumer (Autocorrelation.R, the breadth awk) sums over all rows.
+        # This removes the heaviest single step of the BAM path: no external
+        # sort, no spill, no second read of the track (item 3.5/7).
+        # Memory is bounded by the number of DISTINCT depth pairs (hundreds at
+        # 0.1X, ~max_depth^2 in the worst case), not by genome size.
+        if [ "${SINGLECHECK_LEGACY_AUTOCORR:-0}" = "1" ]; then
+            "$BEDTOOLS" unionbedg -filler NA  \
+            -i ${WORKPFX}.${WSIZE}.per-base.bed.gz \
+            ${WORKPFX}.${WSIZE}.${DELTA}.bed.gz | \
+            grep -E "$DIPLOID_REGEX" | \
+            sort --parallel=$THREADS -S 80% --compress-program=$SORTCOMP -T "$SCRATCH" --version-sort -k4 -k5 | \
+            awk  \
+            '{if (FNR==1){diff=$3-$2;value1=$4;value2=$5}
+            else if (value1!=$4 || value2!=$5){print value1"\t"value2"\t"diff; diff=$3-$2;value1=$4;value2=$5}
+            else{diff=diff+($3-$2);value1=$4;value2=$5}
+            }END{print value1"\t"value2"\t"diff}' \
+            > ${WORKPFX}.${DELTA}.shiftedcov.txt
+        else
+            "$BEDTOOLS" unionbedg -filler NA  \
+            -i ${WORKPFX}.${WSIZE}.per-base.bed.gz \
+            ${WORKPFX}.${WSIZE}.${DELTA}.bed.gz | \
+            grep -E "$DIPLOID_REGEX" | \
+            awk '{pair[$4"\t"$5] += $3-$2}
+                 END{for (p in pair) print p"\t"pair[p]}' \
+            > ${WORKPFX}.${DELTA}.shiftedcov.txt
+        fi
 
 echo "> Calculating gini and cv"
         # Create a frequency table
-        zcat ${NAME}.${WSIZE}.regions.bed.gz | \
+        zcat ${WORKPFX}.${WSIZE}.regions.bed.gz | \
         grep -E "$DIPLOID_REGEX" | \
         awk '{print $4}' | \
         sort -n -T "$SCRATCH" | \
         uniq -c | \
         awk '{print $2"\t"$1}' | sort -n -k1,1 -T "$SCRATCH" \
-        > ${NAME}.${WSIZE}.freqs.txt
+        > ${WORKPFX}.${WSIZE}.freqs.txt
 
-Rscript ${SCRIPTDIR}/src/GiniIndex.R ${NAME}.${WSIZE} $WSIZE
-Rscript ${SCRIPTDIR}/src/CoefficientOfVariation.R ${NAME}.${WSIZE}
+Rscript ${SCRIPTDIR}/src/GiniIndex.R ${WORKPFX}.${WSIZE} $WSIZE
+Rscript ${SCRIPTDIR}/src/CoefficientOfVariation.R ${WORKPFX}.${WSIZE}
 
 echo "> Calculating autocorrelation"
 
-Rscript ${SCRIPTDIR}/src/Autocorrelation.R ${NAME}.${DELTA} $DELTA
+Rscript ${SCRIPTDIR}/src/Autocorrelation.R ${WORKPFX}.${DELTA} $DELTA
 
 
 echo "> Calculating MAD"
@@ -837,68 +1010,82 @@ echo "> Calculating MAD"
         # Paste values from consecutive windows together
         # I do not want to consider the counts from the last window because is shorter than the other
         # I should not use last comparison neither because it uses last window for one element. I have to only use the first column for calculating the average depth
-        zcat ${NAME}.${WSIZE}.regions.bed.gz | \
+        zcat ${WORKPFX}.${WSIZE}.regions.bed.gz | \
                 tail -n +2 | \
-                paste  <(zcat ${NAME}.${WSIZE}.regions.bed.gz) - | \
+                paste  <(zcat ${WORKPFX}.${WSIZE}.regions.bed.gz) - | \
                 grep -E "$DIPLOID_REGEX" | \
                 awk '{if (NF==8 && $1==$5) {print $4"\t"$8} else if (NF==8 && $1!=$5){print $4}}' | \
                 sort -T "$SCRATCH" | uniq -c | \
                 awk '{if (NF==3) {print $2"\t"$3"\t"$1}else {print $2"\tNA\t"$1}}' \
-                > ${NAME}.${WSIZE}.contiguous.txt
+                > ${WORKPFX}.${WSIZE}.contiguous.txt
 
 
-Rscript ${SCRIPTDIR}/src/MAD.R ${NAME}.${WSIZE}
+Rscript ${SCRIPTDIR}/src/MAD.R ${WORKPFX}.${WSIZE}
 
-# Run Metaphyler on all unmapped reads, not only the downsampled ones
-echo "> METAPHYLER"
-samtools view -f 0x4 -@ $THREADS $SAMREF ${ALN} | awk '{OFS="\t"; print ">"$1"\n"$10}' > ${NAME}.unmapped.fasta
-if ! "$METAPHYLER" 2 ${NAME}.unmapped.fasta ${NAME} || [ ! -s ${NAME}.genus.tab ]; then
-    printf "\nWarning: MetaPhyler did not produce %s.genus.tab -- the contaminants\n" "${NAME}" >&2
-    printf "         column will be NA. Every other metric is unaffected.\n" >&2
-    printf "         Check the installation at %s\n" "$METAPHYLER" >&2
+############################################################################
+#                        MAPPING STATISTICS                                #
+############################################################################
+# The old code wrote a primary-only COPY of the analysis BAM, indexed it and
+# then ran `samtools idxstats` on it three times -- a full decompress +
+# recompress + write + index just to get three counters (and, with -N, that
+# copy is the whole multi-TB file). One streaming pass over primary records
+# produces exactly the same three numbers with no temp file and no index
+# (items 3.1/6.4).
+#   idxstats col3 (mapped)   == primary records with flag 0x4 clear
+#   idxstats col4 (unmapped) == primary records with flag 0x4 set
+#   MT_mappedreads           == mapped primary records whose RNAME matches $MT_REGEX
+read mt_perc_totalreads unmapped_perc_totalreads < <(
+    samtools view -F 2304 -@ $THREADS $SAMREF ${WORKPFX}.${downsampling_depth}X.bam | \
+    awk -v mtre="$MT_REGEX" '
+        { total++
+          if (int($2/4)%2 == 1) { unmapped++ }
+          else if ($3 ~ mtre)   { mt++ } }
+        END{ if (total>0) printf "%s %s\n", mt/total*100, unmapped/total*100
+             else printf "NA NA\n" }')
+#breadth=$(awk -v gl=$genome_length '{if ($1==0){sum+=$3}}END{print (1 - sum/gl)*100}' ${WORKPFX}.${DELTA}.shiftedcov.txt)
+breadth=$(awk '{if ($1==0){sum+=$3}else if ($1!="NA"){rest+=$3}}END{print 100 - ((sum/(rest+sum))*100)}' ${WORKPFX}.${DELTA}.shiftedcov.txt)
+# The contaminants column is the only thing that needs the MetaPhyler branch:
+# join it here, at the last possible moment, so its full-file scan had the whole
+# coverage branch to overlap with (item 5.3).
+if [ -n "$MP_PID" ]; then
+    echo "> Waiting for the MetaPhyler branch"
+    wait "$MP_PID"
+    [ -f ${WORKPFX}.metaphyler.log ] && cat ${WORKPFX}.metaphyler.log
 fi
 
-
-samtools view -bF 2304 -@ $THREADS ${NAME}.${downsampling_depth}X.bam > ${NAME}.${downsampling_depth}X.primary.bam
-samtools index -@ $THREADS ${NAME}.${downsampling_depth}X.primary.bam
-MT_mappedreads=$(samtools idxstats ${NAME}.${downsampling_depth}X.primary.bam | grep -E "$MT_REGEX" | awk '{print $3}')
-mt_perc_totalreads=$(samtools idxstats ${NAME}.${downsampling_depth}X.primary.bam | awk -v mt=$MT_mappedreads '{sum+=($3+$4)}END{print mt/sum*100}')
-unmapped_perc_totalreads=$(samtools idxstats ${NAME}.${downsampling_depth}X.primary.bam | \
-        awk '{mapped+=$3;unmapped+=$4}END{print unmapped/(unmapped+mapped)*100}')
-#breadth=$(awk -v gl=$genome_length '{if ($1==0){sum+=$3}}END{print (1 - sum/gl)*100}' ${NAME}.${DELTA}.shiftedcov.txt)
-breadth=$(awk '{if ($1==0){sum+=$3}else if ($1!="NA"){rest+=$3}}END{print 100 - ((sum/(rest+sum))*100)}' ${NAME}.${DELTA}.shiftedcov.txt)
-if [ -s ${NAME}.genus.tab ]; then
-    class=$(awk '{if ($1 !~ "{") print $0}' ${NAME}.genus.tab | grep -v "^@" | awk '{print $1"-"$2"-"$3"-"$4"-"$5}' | tr -s '\n' ',' | sed 's/,$/\n/')
+if [ -s ${WORKPFX}.genus.tab ]; then
+    class=$(awk '{if ($1 !~ "{") print $0}' ${WORKPFX}.genus.tab | grep -v "^@" | awk '{print $1"-"$2"-"$3"-"$4"-"$5}' | tr -s '\n' ',' | sed 's/,$/\n/')
 else
     class="NA"
 fi
-SAMPLE=$(basename $NAME)
-echo $SAMPLE
-WORKDIR=$(dirname "$NAME")
-echo $WORKDIR
-autocorrelation=$(awk '{print $2}' ${WORKDIR}/Autocorrelation.${SAMPLE}.${DELTA}.txt)
-gini=$(awk '{print $2}' ${WORKDIR}/Gini.${SAMPLE}.${WSIZE}.txt)
-CV=$(awk '{print $2}' ${WORKDIR}/CV.${SAMPLE}.${WSIZE}.txt)
-MAD=$(awk '{print $2}' ${WORKDIR}/MAD.${SAMPLE}.${WSIZE}.txt)
+autocorrelation=$(awk '{print $2}' ${RESDIR}/Autocorrelation.${SAMPLE}.${DELTA}.txt)
+gini=$(awk '{print $2}' ${RESDIR}/Gini.${SAMPLE}.${WSIZE}.txt)
+CV=$(awk '{print $2}' ${RESDIR}/CV.${SAMPLE}.${WSIZE}.txt)
+MAD=$(awk '{print $2}' ${RESDIR}/MAD.${SAMPLE}.${WSIZE}.txt)
 
-rm ${NAME}.${downsampling_depth}X.ba*
-rm ${NAME}.${downsampling_depth}X.primary.bam
-rm ${NAME}.${downsampling_depth}X.primary.bam.bai
-rm ${NAME}.${DELTA}.shiftedcov.txt
-rm ${NAME}.${WSIZE}.${DELTA}.bed.gz
-rm ${NAME}.${WSIZE}.contiguous.txt
-rm ${NAME}.${WSIZE}.freqs.txt
-rm ${NAME}.${WSIZE}.regions.bed.gz
-rm ${NAME}.${WSIZE}.regions.bed.gz.csi
-rm ${NAME}.${WSIZE}.per-base.bed.gz
-rm ${NAME}.${WSIZE}.per-base.bed.gz.csi
-rm ${NAME}.unmapped.fasta
-rm -f ${NAME}*.tab      # -f: MetaPhyler may have produced nothing
-rm -f ${NAME}.map
-rm ${WORKDIR}/CV.${SAMPLE}.${WSIZE}.txt
-rm ${WORKDIR}/Gini.${SAMPLE}.${WSIZE}.txt
-rm ${WORKDIR}/Autocorrelation.${SAMPLE}.${DELTA}.txt
-rm  ${WORKDIR}/MAD.${SAMPLE}.${WSIZE}.txt
+# Intermediates: when they live on node-local scratch the EXIT trap wipes the
+# whole directory in one go; otherwise remove them one by one as before.
+if [ -n "$SCRATCHWORK" ]; then
+    :
+else
+    rm -f ${WORKPFX}.${downsampling_depth}X.ba*
+    rm -f ${WORKPFX}.${DELTA}.shiftedcov.txt
+    rm -f ${WORKPFX}.${WSIZE}.${DELTA}.bed.gz
+    rm -f ${WORKPFX}.${WSIZE}.contiguous.txt
+    rm -f ${WORKPFX}.${WSIZE}.freqs.txt
+    rm -f ${WORKPFX}.${WSIZE}.regions.bed.gz
+    rm -f ${WORKPFX}.${WSIZE}.regions.bed.gz.csi
+    rm -f ${WORKPFX}.${WSIZE}.per-base.bed.gz
+    rm -f ${WORKPFX}.${WSIZE}.per-base.bed.gz.csi
+    rm -f ${WORKPFX}.unmapped.fasta
+    rm -f ${WORKPFX}.metaphyler.log
+    rm -f ${WORKPFX}*.tab      # -f: MetaPhyler may have produced nothing
+    rm -f ${WORKPFX}.map
+    rm -f ${RESDIR}/CV.${SAMPLE}.${WSIZE}.txt
+    rm -f ${RESDIR}/Gini.${SAMPLE}.${WSIZE}.txt
+    rm -f ${RESDIR}/Autocorrelation.${SAMPLE}.${DELTA}.txt
+    rm -f ${RESDIR}/MAD.${SAMPLE}.${WSIZE}.txt
+fi
 
 printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$SAMPLE" "$raw_bases" "$DEPTH" "$WSIZE" "$DELTA" "$unmapped_perc_totalreads" "$mt_perc_totalreads" "$breadth" "$autocorrelation" "$CV" "$gini" "$MAD" "$class" > ${NAME}.SingleCheck.txt
 

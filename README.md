@@ -72,7 +72,16 @@ options:
     		'NW_[0-9]*'
   -m <STRING> mitochondrial contig name if different from MT or chrM. 
      Quotes are not required in this case
+  -G use GPU alignment (NVIDIA Parabricks 'pbrun fq2bam') when available.
+     FASTQ input only
 ```
+
+`-t` defaults to `$SLURM_CPUS_PER_TASK`, so on a cluster just ask for the cores you want
+(`./submit --cpus 32 SingleCheck sample.bam`). Intermediates are written to node-local scratch
+(`$SLURM_TMPDIR`) and only the result file goes to the shared filesystem. See
+[OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md) for the HPC behaviour and the environment
+variables that switch each optimization off (`SINGLECHECK_SCRATCH`,
+`SINGLECHECK_LEGACY_AUTOCORR`, `SINGLECHECK_NO_OVERLAP`).
 
 Example
 ```bash
