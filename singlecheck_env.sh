@@ -23,8 +23,22 @@ module load bedtools/2.31.0 2> /dev/null
 #module load blast-plus/2.11.0 2> /dev/null
 
 # --- tools not provided as modules: give absolute paths ----------------------
-export MOSDEPTH=/mnt/lustre/scratch/nlsas/home/ulc/cursos/curso385/mosdepth
-export METAPHYLER=/mnt/lustre/scratch/nlsas/home/ulc/cursos/curso385/MetaPhylerV1.13/metaphyler.pl
+# NOTE: this must be the mosdepth EXECUTABLE, not the directory that contains it
+# ("...: Is a directory" at run time). Anything already exported (e.g. by
+# runner.sh) wins; otherwise try the usual layouts of that directory.
+SC_CURSO=/mnt/lustre/scratch/nlsas/home/ulc/cursos/curso385
+if [ -z "${MOSDEPTH:-}" ] || [ -d "${MOSDEPTH:-}" ]; then
+    for sc_cand in "$SC_CURSO"/mosdepth/bin/mosdepth \
+                   "$SC_CURSO"/mosdepth/mosdepth \
+                   "$SC_CURSO"/mosdepth; do
+        if [ -f "$sc_cand" ] && [ -x "$sc_cand" ]; then
+            export MOSDEPTH="$sc_cand"
+            break
+        fi
+    done
+    unset sc_cand
+fi
+export METAPHYLER=$SC_CURSO/MetaPhylerV1.13/metaphyler.pl
 
 # BLAST is looked up on $PATH by MetaPhyler itself, so an absolute path to the
 # binary would not help: give the DIRECTORY that holds blastall / blastn and
