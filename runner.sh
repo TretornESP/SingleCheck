@@ -55,6 +55,16 @@ fail() { printf '\nSTOP: %s\n' "$1" >&2; exit 1; }
 cd "$REPO" || fail "cannot cd to $REPO"
 [ -r "$BAM" ] || fail "input not readable: $BAM"
 
+# The CURRENT arm must understand the flags exported below and carry the phase
+# timing; unknown variables are silently ignored, which would look like a
+# successful but meaningless comparison. (The baseline arm is expected to lack
+# them -- that is the point of the A/B.)
+missing_feats=""
+for feat in print_timings SINGLECHECK_SKIP_METAPHYLER; do
+    grep -q "$feat" "$REPO/SingleCheck" || missing_feats="$missing_feats $feat"
+done
+[ -n "$missing_feats" ] && fail "this checkout of SingleCheck does not support:$missing_feats -- git pull in $REPO first"
+
 # ---------------------------------------------------------------------------
 # 1. baseline worktree -- on Lustre, not /tmp: the compute node must see it
 # ---------------------------------------------------------------------------

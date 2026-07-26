@@ -53,6 +53,27 @@ echo " repo  : $REPO"
 echo "=============================================================="
 
 # ---------------------------------------------------------------------------
+# 0. Does THIS SingleCheck understand the flags this runner exports? Unknown
+#    environment variables are silently ignored by the pipeline, so an older
+#    checkout would run happily and quietly do none of the optimizations --
+#    and produce no timing summary. Refuse to queue a multi-hour job like that.
+# ---------------------------------------------------------------------------
+missing_feats=""
+for feat in print_timings \
+            SINGLECHECK_SKIP_METAPHYLER \
+            SINGLECHECK_INDEX_DEPTH \
+            SINGLECHECK_FAST_UNMAPPED; do
+    grep -q "$feat" "$REPO/SingleCheck" || missing_feats="$missing_feats $feat"
+done
+if [ -n "$missing_feats" ]; then
+    printf 'This SingleCheck does not support:%s\n' "$missing_feats" >&2
+    printf 'The checkout at %s is older than this runner: the exported\n' "$REPO" >&2
+    printf 'variables would be silently ignored and no timing summary produced.\n' >&2
+    fail "update the checkout (git pull) before submitting"
+fi
+echo "[ok]   pipeline supports the optimization flags and phase timing"
+
+# ---------------------------------------------------------------------------
 # 1. Per-cluster environment. Resolve the tools exactly the way the pipeline
 #    will (by sourcing the same file), then verify them HERE -- a broken
 #    $MOSDEPTH must not be discovered 30 seconds into a 24 h allocation.
